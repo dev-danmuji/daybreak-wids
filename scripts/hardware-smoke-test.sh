@@ -201,17 +201,23 @@ if [ "$MODE" = discover ]; then
   exit 0
 fi
 
-LOGDIR=$(python3 - "$CONFIG" <<'EOF'
-import os, sys, yaml
+# log directory and database path from the config (venv python: it has PyYAML), one per line
+mapfile -t CFG_PATHS < <("$(dirname "$DAYBREAK")/python" - "$CONFIG" 2>/dev/null <<'EOF' || true
+import os, sys
+import yaml
 cfg = yaml.safe_load(open(sys.argv[1])) or {}
-d = (cfg.get("logging") or {}).get("directory", "var/log")
-print(d if os.path.isabs(d) else os.path.join(os.path.dirname(sys.argv[1]), d))
+base = os.path.dirname(sys.argv[1])
+def resolve(p): return p if os.path.isabs(p) else os.path.join(base, p)
+print(resolve((cfg.get("logging") or {}).get("directory", "var/log")))
+print(resolve((cfg.get("storage") or {}).get("database", "var/daybreak.db")))
 EOF
-) || LOGDIR=var/log
+)
+LOGDIR=${CFG_PATHS[0]:-var/log}
+DBPATH=${CFG_PATHS[1]:-var/daybreak.db}
 python3 - "$OUT/report.json" "$OUT/monitor.txt" "$LOGDIR" "$MON_RC" "$SENSOR" "$CHANNEL" "$(( END - START ))" \
-    > "$OUT/summary.txt" <<'EOF'
-import json, os, sys
-rep_path, mon_path, logdir, rc, sensor, channel, seconds = sys.argv[1:8]
+    "$DBPATH" > "$OUT/summary.txt" <<'EOF'
+import json, os, stat, sys
+rep_path, mon_path, logdir, rc, sensor, channel, seconds, db_path = sys.argv[1:9]
 rep = json.load(open(rep_path))
 mon = open(mon_path, errors="replace").read()
 ev = rep.get("events") or {}
@@ -237,6 +243,12 @@ print(f"HIGH/CRITICAL alerts  : {sum(by_sev.get(k, 0) for k in ('HIGH', 'CRITICA
 print("sensor status records : " + (", ".join(s for s in statuses if s) or "none"))
 print(f"alerts.jsonl lines    : {lines('alerts.jsonl')}")
 print(f"daybreak.log lines    : {lines('daybreak.log')}")
+try:  # before the final chown: were the root-written files handed back automatically?
+    st = os.stat(db_path)
+    owner = "you" if st.st_uid == os.getuid() else f"uid {st.st_uid}"
+    print(f"database owner/mode   : {owner}, {oct(stat.S_IMODE(st.st_mode))}")
+except OSError as exc:
+    print(f"database owner/mode   : not readable ({exc.strerror})")
 EOF
 say "summary (counts only, safe to share)"
 cat "$OUT/summary.txt"
