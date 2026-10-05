@@ -1,5 +1,9 @@
 # daybreak-wids 마일스톤 보고
 
+> Development log (Korean) of milestones M0–M9, kept as written at the time. For the current
+> state see [README.md](../README.md), [VALIDATION.md](VALIDATION.md) and
+> [CHANGELOG.md](../CHANGELOG.md).
+
 기준일 2026-10-05. 기존 코드 없음(빈 디렉터리)에서 시작. 테스트 수는 각 마일스톤 완료 시점의 누적 `pytest` 결과.
 
 | | 범위 | 누적 테스트 |
@@ -119,16 +123,11 @@
 
 ## 실제 하드웨어 검증 절차(사용자 실행)
 
-```bash
-# Kismet 경로(권장, daybreak는 root 불필요)
-sudo apt install kismet
-daybreak-wids kismet config            # kismet_site.conf에 반영
-export KISMET_API_KEY=...              # Kismet UI에서 readonly 역할 키 생성
-daybreak-wids kismet check && daybreak-wids monitor start
+v0.1.0 기준 절차는 [README.md](../README.md)의 *Kismet backend* / *Passive backend* 절과
+[VALIDATION.md](VALIDATION.md)에 있다. `sudo`는 `PATH`와 `HOME`을 초기화하므로 venv의 실행
+파일을 직접 지정하고 `-c`를 항상 준다. passive 경로는 안내 스크립트로 실행한다.
 
-# 내장 passive 경로
-daybreak-wids sensor prepare --channel 36           # 계획만 출력
-sudo daybreak-wids sensor prepare --apply --channel 36
-sudo daybreak-wids monitor start --backend passive
-sudo daybreak-wids sensor release --apply
+```bash
+scripts/hardware-smoke-test.sh discover   # SSID만 등록된 네트워크의 BSSID 후보 확인(자동 채택 없음)
+scripts/hardware-smoke-test.sh run        # 사전 점검 → 센서 준비 → passive 관찰 → 해제, wlo1 불변 검증
 ```
