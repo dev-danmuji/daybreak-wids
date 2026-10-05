@@ -2,7 +2,7 @@
 
 A passive, defensive wireless intrusion detection system for Linux, written in
 Python, for Wi-Fi networks the operator owns or is authorized to monitor.
-Status: v0.1.0, 478 automated tests; live capture on real hardware and a
+Status: v0.1.0, 491 automated tests; live capture on real hardware and a
 real Kismet server are not yet verified (see [VALIDATION.md](VALIDATION.md)).
 
 ## Problem
@@ -56,7 +56,7 @@ the frames.
 | Area | Implementation |
 |---|---|
 | Language / packaging | Python 3.10+ (tested 3.10–3.14), setuptools, `click` CLI, `PyYAML` strict config loader; optional FastAPI dashboard and websocket eventbus extras |
-| Size | 10,174 lines of Python in the `daybreak` package (plus 524 lines of dashboard HTML/JS/CSS), 5,820 lines of Python under `tests/` |
+| Size | 10,246 lines of Python in the `daybreak` package (plus 524 lines of dashboard HTML/JS/CSS), 6,026 lines of Python under `tests/` |
 | Capture backends | Kismet REST + eventbus client (read-only endpoints, field allow-list, readonly API key, optional receive-only frame tap); built-in `AF_PACKET` backend (socket only read) with guarded channel hopping; pcap / pcapng reader; JSONL replay |
 | Frame parsing | Own radiotap, IEEE 802.11 management/data, RSN / WPA / RSNXE parser; EAPOL message number inferred from the 2-byte Key Information field only |
 | Detection | Sliding windows with hysteresis triggers; size-capped per-station and per-BSSID state with idle eviction (registered BSSIDs never evicted); AP security-profile comparison against the registry, the baseline and the AP's own history |
@@ -65,7 +65,7 @@ the frames.
 | Storage | SQLite (WAL, versioned migrations, retention, `secure_delete`), owner-only files, rotating JSONL and human-readable logs |
 | Interfaces | CLI with `--dry-run` / `--json`; read-only localhost dashboard (Host allow-list, CSP, field allow-listed responses) |
 | Safety engineering | Interface guard (protected interfaces, default-route interface and PHY siblings refused; identity re-checked before every command; continuous verification while monitoring), runtime command allow-list, AST-based static safety tests |
-| Tests | 478 tests: synthetic frames and fixtures, a simulated Kismet server, a simulated host (sysfs, `iw`, `nmcli`), README output verification; during the run, `AF_PACKET` sockets and `subprocess.run` calls to network tools are refused |
+| Tests | 491 tests: synthetic frames and fixtures, a simulated Kismet server, a simulated host (sysfs, `iw`, `nmcli`), README output verification; during the run, `AF_PACKET` sockets and `subprocess.run` calls to network tools are refused |
 | Hardware | LattePanda 3 Delta (Ubuntu 26.04.1 LTS, Linux 7.0) with an ALFA USB adapter, MediaTek MT7921U (`mt7921u`), 2.4 / 5 / 6 GHz |
 
 ## Validation

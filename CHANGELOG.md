@@ -53,7 +53,7 @@ packet injection, no deauthentication, no credential cracking or recovery.
   escalation and per-notifier rate limits; extensible notifier interface.
 - **CLI** (`daybreak-wids`) with `--dry-run` and `--json`.
 - **Local dashboard** (optional extra): read-only, `127.0.0.1` by default.
-- **Synthetic regression suite**: 478 tests, synthetic metadata fixtures
+- **Synthetic regression suite**: 491 tests, synthetic metadata fixtures
   (normal, deauth burst, handshake pattern, evil twin, sensor flap, malformed),
   simulated Kismet API and simulated host; the README's marked example blocks
   are verified against the real CLI.

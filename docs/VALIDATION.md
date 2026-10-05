@@ -21,8 +21,8 @@ extrapolated. Date of all runs: 2026-10-05.
 
 | | |
 |---|---|
-| Total | 478 |
-| Passed | 478 |
+| Total | 491 |
+| Passed | 491 |
 | Failed | 0 |
 | Before this release work | 296 collected, 296 passed (Python 3.14.4, development venv) |
 
@@ -35,15 +35,15 @@ dry-run replay of `tests/fixtures/handshake_pattern.jsonl` that must print
 
 | Python | Result |
 |---|---|
-| 3.10.22 | PASS: 478 passed, 0 failed; byte-compile, non-root check and demo replay OK |
-| 3.11.17 | PASS: 478 passed, 0 failed; byte-compile, non-root check and demo replay OK |
-| 3.12.3 | PASS: 478 passed, 0 failed; byte-compile, non-root check and demo replay OK |
-| 3.13.16 | PASS: 478 passed, 0 failed; byte-compile, non-root check and demo replay OK |
-| 3.14.4 | PASS: 478 passed, 0 failed; byte-compile, non-root check and demo replay OK |
+| 3.10.22 | PASS: 491 passed, 0 failed; byte-compile, non-root check and demo replay OK |
+| 3.11.17 | PASS: 491 passed, 0 failed; byte-compile, non-root check and demo replay OK |
+| 3.12.3 | PASS: 491 passed, 0 failed; byte-compile, non-root check and demo replay OK |
+| 3.13.16 | PASS: 491 passed, 0 failed; byte-compile, non-root check and demo replay OK |
+| 3.14.4 | PASS: 491 passed, 0 failed; byte-compile, non-root check and demo replay OK |
 
 Dependency versions in those environments: PyYAML 6.0.3, click 8.5.0, fastapi
 0.142.2, starlette 1.7.0, uvicorn 0.54.0, websocket-client 1.9.2, pytest 9.1.1,
-httpx 0.28.1. Each run took 21–26 s. GitHub Actions itself has not run yet (no
+httpx 0.28.1. Each run took 24–32 s. GitHub Actions itself has not run yet (no
 remote repository exists); the workflow file mirrors the steps above.
 
 The suite uses no live hardware: synthetic 802.11 frames and radiotap headers,
@@ -282,9 +282,5 @@ own fuzzing (300,000 mutated frames through the frame parser and the pipeline,
   real-world dataset, and thresholds are defaults.
 - One radio hears one channel at a time; Kismet-only mode (no frame tap) cannot
   correlate handshake capture.
-- The README animation (`docs/animation/`) has not been rendered: Manim and
-  ffmpeg are not installed on the machine that prepared this release, and
-  nothing was installed for it. Its source, render script and commands are in
-  `docs/animation/`.
 - The fuzzing done during the review used a scratch harness that is not part of
   the repository; its figures cannot be reproduced from the repository alone.
