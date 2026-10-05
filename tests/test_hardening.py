@@ -1678,3 +1678,184 @@ def test_random_bssid_and_station_floods_cannot_fill_the_database(tmp_path):
     assert stations <= NEW_STATION_ROWS_PER_HOUR * (1 + 20 / 3600) + 1
     assert rt.pipeline.stats["events_not_stored"] == 20_000 - events  # detection still saw them all
     rt.close()
+
+
+# -- fix verification, round 6: review of the round 3-5 fixes ------------------------------------------------
+
+def test_silent_random_bssid_flood_keeps_correlation_bookkeeping_bounded(tmp_path):
+    from daybreak.correlation.engine import MAX_RECENT_BSSIDS
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path), dry_run=True)
+    p = rt.pipeline
+    t0 = 1_790_000_000.0
+    p.process(_deauth(t0, dst="10:22:33:44:55:01"))  # one real disconnect on the protected AP
+    for i in range(MAX_RECENT_BSSIDS * 3):  # then deauths from random BSSIDs to the AP: no findings at all
+        p.process(_deauth(t0 + 1, bssid=f"02:41:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}:01",
+                          dst="AA:BB:CC:DD:EE:FF"))
+    corr = p.correlator
+    assert len(corr.recent_disconnects) <= MAX_RECENT_BSSIDS
+    assert "AA:BB:CC:DD:EE:FF" in corr.recent_disconnects  # the registered BSSID is kept
+    assert not hasattr(p, "_since_expire")  # no event-count expiry: it made each pass scan every BSSID
+    rt.close()
+
+
+def test_eapol_flood_cannot_flush_a_protected_station(tmp_path):
+    from daybreak.models import Event
+    from daybreak.runtime import build_runtime
+
+    victim, ap = "10:22:33:44:55:66", "AA:BB:CC:DD:EE:FF"
+    rt = build_runtime(make_config(tmp_path), dry_run=True)
+    p = rt.pipeline
+    t0 = 1_790_000_000.0
+    n = 0
+    for k in range(4):  # 4 handshake starts for one client, 10 s apart (threshold: 3 in 60 s)
+        ts = t0 + k * 10
+        p.process(Event.from_dict({"ts": ts, "type": "eapol", "bssid": ap, "src": ap, "dst": victim, "eapol_msg": 1}))
+        for _ in range(4200):  # in between: EAPOL frames from random BSSIDs addressed to the AP
+            n += 1
+            p.process(Event.from_dict({"ts": ts + 1 + n * 1e-5, "type": "eapol", "src": f"02:42:00:{n >> 16 & 255:02X}:"
+                                       f"{n >> 8 & 255:02X}:{n & 255:02X}", "bssid": f"02:42:00:{n >> 16 & 255:02X}:"
+                                       f"{n >> 8 & 255:02X}:{n & 255:02X}", "dst": ap}))
+    surges = [a for a in rt.alerts.delivered if a.alert_type == "EAPOL_REAUTH_SURGE" and victim in a.stations]
+    assert surges
+    eapol = next(d for d in p.detectors if d.name == "eapol")
+    assert len(eapol.stations) <= eapol.stations.max_keys
+    rt.close()
+
+
+def test_keyed_state_stays_bounded_when_only_kept_keys_arrive():
+    from daybreak.detectors.window import KeyedState
+
+    ks = KeyedState(dict, max_keys=50, keep=lambda k: k[0] == "home")
+    for i in range(500):
+        ks.get(("home", i), float(i))
+    assert len(ks) == 50 and ("home", 499) in ks and ("home", 0) not in ks
+
+
+def test_a_random_ssid_flood_cannot_crowd_out_a_rogue_bssid_of_a_protected_ssid(tmp_path):
+    from daybreak.models import Event, EventType
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path, detection={"scope": "all"}))
+    t0 = 1_790_000_000.0
+    for i in range(5000):  # 1000 new random SSIDs per second for 5 s
+        rt.pipeline.process(Event(t0 + i / 1000, EventType.BEACON, ssid=f"rnd-{i}", channel=36,
+                                  bssid=f"02:43:00:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}"))
+    rt.pipeline.process(Event(t0 + 5.5, EventType.BEACON, ssid="ExampleSSID", channel=36, bssid="02:13:37:00:00:09"))
+    rt.pipeline.flush()
+    assert rt.db.count_aps(ssid="ExampleSSID", exclude_bssids=["AA:BB:CC:DD:EE:FF", "AA:BB:CC:DD:EE:F0"]) == 1
+    rt.close()
+
+
+def test_events_of_registered_bssids_are_not_sampled_away_by_a_flood_elsewhere(tmp_path):
+    from daybreak.models import Event
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path))
+    t0 = 1_790_000_000.0
+    for i in range(3000):  # random-BSSID deauths aimed at the protected AP use up the overall budget
+        n = f"{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}"
+        rt.pipeline.process(Event.from_dict({"ts": t0 + i / 1000, "type": "deauth", "bssid": f"02:44:00:{n}",
+                                             "src": f"02:45:00:{n}", "dst": "AA:BB:CC:DD:EE:FF", "reason": 7}))
+    for k in range(5):  # the protected AP's own disconnects are still stored
+        rt.pipeline.process(_deauth(t0 + 3.5 + k * 0.01, dst=f"10:22:33:44:55:{k:02X}"))
+    rt.pipeline.flush()
+    rows = rt.db.conn.execute("SELECT COUNT(*) FROM events WHERE bssid = 'AA:BB:CC:DD:EE:FF'").fetchone()[0]
+    assert rows == 5
+    rt.close()
+
+
+def test_prune_does_not_stall_while_a_reader_holds_the_database(tmp_path):
+    import sqlite3
+    import time
+
+    from daybreak.models import Event
+
+    db = Database(tmp_path / "p.db")
+    old = 1_790_000_000.0 - 90 * 86400
+    db.insert_events([Event.from_dict({"ts": old + i, "type": "deauth", "bssid": "AA:BB:CC:DD:EE:FF"})
+                      for i in range(20)])
+    reader = sqlite3.connect(tmp_path / "p.db")
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM events").fetchall()  # an open read transaction (report, backup)
+    try:
+        started = time.monotonic()
+        assert db.prune(older_than=1_790_000_000.0 - 30 * 86400)["events"] == 20
+        assert time.monotonic() - started < 3.0
+    finally:
+        reader.close()
+        db.close()
+
+
+def test_failed_sensor_status_writes_do_not_end_monitoring_or_lose_the_alert(tmp_path):
+    import sqlite3
+
+    from daybreak.monitor import MonitorRunner
+
+    def full(**kw):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    emitted = []
+    runner = MonitorRunner.__new__(MonitorRunner)
+    runner.cfg = make_config(tmp_path)
+    runner.rt = NS(db=NS(record_sensor_status=full), pipeline=NS(stats={"storage_errors": 0},
+                                                                 emit_external=emitted.append))
+    runner.health, runner.backend, runner.clock = None, NS(name="passive"), lambda: 1_790_000_000.0
+    runner.recover, runner.say = None, lambda m: None
+    runner._record("LOST", {})
+    runner._protected_alert(1_790_000_000.0, {"wlo1": ["operstate: up -> down"]})
+    assert runner.rt.pipeline.stats["storage_errors"] == 2
+    assert [a.alert_type for a in emitted] == ["PROTECTED_INTERFACE_CHANGED"]
+
+
+def test_hostile_kismet_numbers_are_dropped(tmp_path):
+    from daybreak.sensor.kismet import alert_to_event, device_to_event, kismet_security, parse_kismet_channel
+
+    huge = int("9" * 401)
+    assert alert_to_event({"kismet.alert.header": "DEAUTHFLOOD", "kismet.alert.timestamp": huge}, "s") is None
+    for v in (float("nan"), float("inf"), -float("inf"), huge):
+        assert parse_kismet_channel(v) is None
+    dev = device_to_event({"mac": "AA:BB:CC:DD:EE:FF", "ssid": "x", "type": "Wi-Fi AP", "crypt_string": "WPA2",
+                           "last_time": huge, "channel": float("nan"), "signal": float("nan")}, "s", 1_790_000_000.0)
+    assert dev.timestamp == 1_790_000_000.0 and dev.channel is None and dev.rssi is None
+    assert kismet_security("WEP" + "\ud800" * 300, None, None, None).pairwise_ciphers[0] == "WEP?????????????"
+
+
+def test_baseline_counts_distinct_candidate_bssids(tmp_path):
+    from daybreak.baseline.engine import build_from_events
+    from daybreak.models import Event, EventType
+
+    t0 = 1_790_000_000.0
+    events = [Event(t0 + i, EventType.BEACON, ssid="ExampleSSID", channel=36, bssid=f"02:51:00:00:00:{i % 70:02X}")
+              for i in range(7000)]  # 70 distinct BSSIDs, 100 beacons each
+    home = build_from_events(make_config(tmp_path), events)["home"]
+    assert len(home["candidate_bssids"]) == 64 and home["candidate_bssid_count"] == 70
+
+
+def test_every_control_and_format_character_is_escaped():
+    import unicodedata
+
+    from daybreak.alerts.formatting import printable
+
+    for ch in ("­", "᠎", "⁪", "￹", "\U000e0001", "\U000e0041", "\ud800", "\x85", " "):
+        assert unicodedata.category(ch) in ("Cf", "Cc", "Cs", "Zp")
+        assert ch not in printable(f"a{ch}b")
+    assert printable("Café ☕ 😀") == "Café ☕ 😀" and printable("plain") == "plain"
+
+
+def test_plain_http_warning_ignores_the_scheme_case(tmp_path, monkeypatch):
+    from daybreak.sensor.kismet import KismetUnavailable
+
+    import daybreak.sensor.kismet as kismet_mod
+
+    monkeypatch.setenv("DAYBREAK_TEST_PLAIN_KEY2", "k")
+    cfg = make_config(tmp_path, backend={"type": "auto", "kismet": {"url": "HTTP://192.0.2.10:2501",
+                                                                     "api_key_env": "DAYBREAK_TEST_PLAIN_KEY2"}})
+    monkeypatch.setattr(kismet_mod.KismetClient, "system_status",
+                        lambda self: (_ for _ in ()).throw(KismetUnavailable("not reachable")))
+    logged = []
+    fs, route = host_sysfs(tmp_path)
+    choose_backend(cfg, guard=InterfaceGuard(["wlo1"], sysfs_root=fs.net, route_file=route, runner=host_runner()),
+                   runner=host_runner(), log=logged.append)
+    assert any("unencrypted" in m for m in logged)

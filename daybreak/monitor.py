@@ -146,18 +146,23 @@ class MonitorRunner:
             self._suspended_recover, self.recover = self.recover, None
         self.say(f"PROTECTED_INTERFACE_CHANGED {detail} (daybreak-wids sends no commands to protected "
                  "interfaces); auto_prepare suspended until it is back to its state at start")
-        self._record("PROTECTED_CHANGED", {"changes": changes})
         self.rt.pipeline.emit_external(protected_alert(
             now, changes, sensor=self.cfg.sensor.interface,
             weight=self.cfg.scoring.weight("protected_interface_changed")))
+        self._record("PROTECTED_CHANGED", {"changes": changes})
 
     # -- status ------------------------------------------------------------------
     def _record(self, status: str, details: dict[str, Any] | None = None) -> None:
-        if self.rt.db is not None:
+        if self.rt.db is None:
+            return
+        try:
             self.rt.db.record_sensor_status(sensor=self.cfg.sensor.interface,
                                             interface=self.health.interface if self.health else None,
                                             status=status, backend=self.backend.name, details=details or {},
                                             timestamp=self.clock())
+        except (sqlite3.Error, ValueError) as exc:  # a full or locked database must not end monitoring
+            self.rt.pipeline.stats["storage_errors"] += 1
+            logging.getLogger("daybreak.monitor").warning("sensor status write failed: %s", exc)
 
     def _status_doc(self, state: str) -> dict[str, Any]:
         p = self.rt.pipeline

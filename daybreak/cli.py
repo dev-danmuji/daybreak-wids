@@ -745,7 +745,10 @@ def _print_baseline(name: str, doc: dict[str, Any]) -> None:
         click.echo(f"  {bssid}: ch {','.join(map(str, info['channels'])) or '-'}, {rssi}, "
                    f"{info['security']['mode'] if info.get('security') else '?'}")
     if doc.get("candidate_bssids"):
-        click.echo(f"  unregistered BSSIDs seen: {', '.join(doc['candidate_bssids'])}")
+        total = doc.get("candidate_bssid_count")
+        more = (f" ({'at least ' if doc.get('candidate_count_is_lower_bound') else ''}{total} in total)"
+                if total and total > len(doc["candidate_bssids"]) else "")
+        click.echo(f"  unregistered BSSIDs seen: {', '.join(doc['candidate_bssids'])}{more}")
     click.echo("")
 
 

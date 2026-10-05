@@ -230,10 +230,12 @@ def _text(value: Any) -> str:
 
 
 def _as_float(value: Any) -> float | None:
+    """A finite number, or None (Kismet JSON can carry NaN, Infinity or 400-digit integers)."""
     try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
+        f = float(value) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
         return None
+    return f if f is not None and math.isfinite(f) else None
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +247,9 @@ def parse_kismet_channel(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return int(value) if 1 <= int(value) <= 233 else None
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return int(value) if 1 <= value <= 233 else None  # an int of any size compares exactly
     m = re.match(r"\s*(\d+)", str(value))
     if not m:
         return None
@@ -286,7 +290,7 @@ def kismet_security(crypt: str | None, mfp_required: Any = None, mfp_supported: 
         return SecurityProfile(source="kismet")
     tokens = text.split()
     if tokens[0].upper().startswith("WEP"):
-        return SecurityProfile(privacy=True, pairwise_ciphers=(tokens[0].upper(),), source="kismet")
+        return SecurityProfile(privacy=True, pairwise_ciphers=(clean_text(tokens[0])[:16].upper(),), source="kismet")
     akms: list[str] = []
     ciphers: list[str] = []
     versions = set()

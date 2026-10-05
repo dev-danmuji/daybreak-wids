@@ -62,8 +62,8 @@ def choose_backend(config: Config, kind: str | None = None, *, replay: str | Pat
             log(f"running as root without ${kcfg.api_key_env}: sudo drops environment variables "
                 f"(use `sudo --preserve-env={kcfg.api_key_env} ...`)")
         client = KismetClient.from_config(kcfg)
-        if client.base.startswith("http://") and client.auth_headers() and \
-                not is_loopback_host(urllib.parse.urlsplit(client.base).hostname or ""):
+        parts = urllib.parse.urlsplit(client.base)
+        if parts.scheme == "http" and client.auth_headers() and not is_loopback_host(parts.hostname or ""):
             log("WARNING: Kismet credentials are sent unencrypted over http to a non-loopback host; "
                 "use https, or run Kismet on this machine")
         reachable = True

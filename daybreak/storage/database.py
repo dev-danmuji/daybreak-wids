@@ -503,8 +503,15 @@ class Database:
         with self.transaction() as conn:
             removed = {table: conn.execute(sql, (older_than,)).rowcount for table, sql in statements.items()}
         if any(removed.values()) and self.path != ":memory:":
-            # The deleted rows' old page images stay in the -wal file until it is reset.
-            self._execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # The deleted rows' old page images stay in the -wal file until it is reset. TRUNCATE
+            # waits for readers; with a short busy timeout a reader (report, dashboard, backup)
+            # only postpones it to the next hourly prune instead of stalling the monitor.
+            with self._lock:
+                self.conn.execute("PRAGMA busy_timeout = 200")
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+                finally:
+                    self.conn.execute("PRAGMA busy_timeout = 10000")
         return removed
 
     def table_names(self) -> list[str]:

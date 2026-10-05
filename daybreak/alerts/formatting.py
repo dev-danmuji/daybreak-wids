@@ -2,23 +2,30 @@
 
 from __future__ import annotations
 
-import re
+import unicodedata
 
 from ..models import Alert, format_local
 from ..scoring import explain
 
-# C0/C1 controls, Unicode line/paragraph separators, bidi controls and invisible characters: an
-# attacker-chosen SSID or a relayed Kismet alert text must not move the cursor, forge log lines,
-# reorder what is shown or hide text.
-_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
+# Control and format characters, line/paragraph separators and lone surrogates (Unicode
+# categories Cc, Cf, Zl, Zp, Cs): an attacker-chosen SSID or a relayed Kismet alert text must
+# not move the cursor, forge log lines, reorder what is shown or hide text.
+_ESCAPED = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"})
+
+
+def _escape(ch: str) -> str:
+    if unicodedata.category(ch) not in _ESCAPED:
+        return ch
+    c = ord(ch)
+    return f"\\x{c:02x}" if c < 0x100 else f"\\u{c:04x}" if c < 0x10000 else f"\\U{c:08x}"
 
 
 def printable(text: object) -> str:
-    """``text`` with control characters shown as ``\\xNN`` / ``\\uNNNN`` escapes."""
-    def esc(m: re.Match) -> str:
-        c = ord(m.group())
-        return f"\\x{c:02x}" if c < 0x100 else f"\\u{c:04x}"
-    return _UNPRINTABLE.sub(esc, str(text))
+    """``text`` with those characters shown as ``\\xNN`` / ``\\uNNNN`` / ``\\UNNNNNNNN`` escapes."""
+    s = str(text)
+    if s.isascii() and s.isprintable():
+        return s
+    return "".join(_escape(ch) for ch in s)
 
 
 def human_lines(alert: Alert) -> list[str]:

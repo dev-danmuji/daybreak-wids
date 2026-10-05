@@ -48,15 +48,18 @@ class StorageBudget:
         return False
 
 
-# Stored per (event type, BSSID): a burst of 500, then 50 per second; and overall a burst of 1000,
-# then 100 per second (a flood from random BSSIDs would get a fresh burst for every BSSID).
+# Stored per (event type, BSSID): a burst of 500, then 50 per second; and for unregistered BSSIDs
+# also a burst of 1000, then 100 per second over all of them (a flood from random BSSIDs would
+# otherwise get a fresh burst for every BSSID).
 EVENT_STORAGE_RATE, EVENT_STORAGE_BURST = 50.0, 500.0
 EVENT_STORAGE_TOTAL_RATE, EVENT_STORAGE_TOTAL_BURST = 100.0, 1000.0
-# New database rows for unregistered BSSIDs: 256 per SSID and hour, and 1024 per hour over all
-# SSIDs (with detection.scope "all", a flood of random SSIDs would otherwise get 256 each).
+# New database rows for unregistered BSSIDs: 256 per SSID and hour, and for SSIDs that are not
+# protected also 1024 per hour over all of them (with detection.scope "all", a flood of random
+# SSIDs would otherwise get 256 each, and must not crowd out a rogue BSSID of a protected SSID).
 UNKNOWN_AP_ROWS_PER_HOUR = 256
 UNKNOWN_AP_ROWS_TOTAL_PER_HOUR = 1024
-# New station rows (a flood of random client MACs would add one per MAC): 1024 per hour.
+# New station rows (a flood of random client MACs would add one per MAC): 1024 per hour for each
+# registered BSSID, and 1024 per hour for all other BSSIDs together.
 NEW_STATION_ROWS_PER_HOUR = 1024
 MAX_STATION_WRITE_KEYS = 8192
 MAX_AP_WRITE_KEYS = 8192
@@ -158,7 +161,6 @@ class Pipeline:
         self._unknown_ap_total = StorageBudget(UNKNOWN_AP_ROWS_TOTAL_PER_HOUR / 3600.0, UNKNOWN_AP_ROWS_TOTAL_PER_HOUR)
         self._last_flush = time.monotonic()
         self._last_expire: float | None = None
-        self._since_expire = 0
         self.last_event_ts: float | None = None
         self.last_error: str | None = None
         self.type_counts: Counter[str] = Counter()
@@ -239,13 +241,12 @@ class Pipeline:
         self._emit([alert], None)
 
     def _maybe_expire(self, now: float) -> None:
-        # Every minute of event time, and every 10,000 events (a capture whose timestamps do
-        # not advance must not keep idle state forever).
-        self._since_expire += 1
+        # Idle state is dropped every minute of event time. Growth is bounded independently of
+        # this (every per-key structure is capped when keys are added), so a capture whose
+        # timestamps do not advance is safe too.
         if self._last_expire is None:
             self._last_expire = now
-        elif now - self._last_expire >= 60.0 or self._since_expire >= 10_000:
-            self._since_expire = 0
+        elif now - self._last_expire >= 60.0:
             for det in self.detectors:
                 expire = getattr(det, "expire", None)
                 if expire:
@@ -259,8 +260,9 @@ class Pipeline:
             return
         if ev.event_type in AP_OBSERVATION_TYPES:
             self._store_ap(ev)
-        elif self._event_budget.allow((ev.event_type.value, ev.bssid), ev.timestamp) and \
-                self._event_total.allow(None, ev.timestamp):
+        elif self._event_budget.allow((ev.event_type.value, ev.bssid), ev.timestamp) and (
+                self.registry.by_bssid(ev.bssid) is not None  # a flood elsewhere never costs these rows
+                or self._event_total.allow(None, ev.timestamp)):
             self._events.append(ev)
         else:
             self.stats["events_not_stored"] += 1
@@ -283,7 +285,8 @@ class Pipeline:
         authorized = self.registry.is_authorized(ev.ssid, ev.bssid)
         if last is None and authorized is not True and not (
                 self._unknown_ap_budget.allow(ev.ssid or "", ev.timestamp)
-                and self._unknown_ap_total.allow(None, ev.timestamp)):
+                and (authorized is False  # an unregistered BSSID for a protected SSID: per-SSID budget only
+                     or self._unknown_ap_total.allow(None, ev.timestamp))):
             self.stats["aps_not_stored"] += 1  # beacon flood with random BSSIDs / SSIDs: keep a sample
             return
         self._ap_written[key] = (ev.timestamp, sec, ev.channel)
@@ -321,7 +324,8 @@ class Pipeline:
                 key = (sta, bssid)
                 if key in self._station_written:
                     self._station_written.move_to_end(key)
-                elif not self._station_budget.allow(None, self._station_seen[key]):
+                elif not self._station_budget.allow(bssid if self.registry.by_bssid(bssid) else None,
+                                                    self._station_seen[key]):
                     self.stats["stations_not_stored"] += 1  # random client MACs: keep a sample
                     continue
                 else:

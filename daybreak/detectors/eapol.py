@@ -55,6 +55,7 @@ class EapolDetector:
     def process(self, ev: Event, ctx: DetectionContext) -> list[Finding]:
         if self.bssids.keep is None:
             self.bssids.keep = lambda bssid, reg=ctx.registry: reg.by_bssid(bssid) is not None
+            self.stations.keep = lambda key, reg=ctx.registry: reg.by_bssid(key[0]) is not None
         if ev.event_type is not EventType.EAPOL or not ev.bssid:
             return []
         ts = ev.timestamp

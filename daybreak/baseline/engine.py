@@ -29,8 +29,10 @@ from ..registry import NetworkRegistry
 
 METRICS = ("disconnects", "eapol", "connects")
 MAX_BASELINE_SPAN = 14 * 86400.0  # seconds of input used for rate statistics
-# Unregistered BSSIDs listed in a baseline (a beacon flood while learning: the rest are counted).
+# Unregistered BSSIDs listed in a baseline, and how many distinct ones are counted at most
+# (a beacon flood while learning: the count is then a lower bound).
 MAX_CANDIDATES = 64
+MAX_CANDIDATES_COUNTED = 10_000
 METRIC_LABEL = {"disconnects": "disconnect frames", "eapol": "EAPOL frames", "connects": "(re)connections"}
 
 
@@ -72,16 +74,20 @@ class _NetAccumulator:
     bssid_security: dict[str, Counter] = field(default_factory=dict)
     profiles: dict[tuple, SecurityProfile] = field(default_factory=dict)
     bssid_obs: Counter = field(default_factory=Counter)
-    candidates: set = field(default_factory=set)   # at most MAX_CANDIDATES, plus the total count
-    candidate_count: int = 0
+    candidates: set = field(default_factory=set)        # listed: at most MAX_CANDIDATES
+    candidates_seen: set = field(default_factory=set)   # counted: at most MAX_CANDIDATES_COUNTED
+    candidates_capped: bool = False
+    events: int = 0
 
     def note_candidate(self, bssid: str) -> None:
-        if bssid in self.candidates:
+        if bssid in self.candidates_seen:
             return
-        self.candidate_count += 1
+        if len(self.candidates_seen) >= MAX_CANDIDATES_COUNTED:
+            self.candidates_capped = True
+            return
+        self.candidates_seen.add(bssid)
         if len(self.candidates) < MAX_CANDIDATES:
             self.candidates.add(bssid)
-    events: int = 0
 
 
 class BaselineBuilder:
@@ -200,8 +206,10 @@ class BaselineBuilder:
                 "known_channels": sorted({c for info in bssids.values() for c in info["channels"]}),
                 "security": strongest.to_dict() if strongest else None,
                 "candidate_bssids": sorted(acc.candidates),
-                **({"candidate_bssid_count": acc.candidate_count}
-                   if acc.candidate_count > len(acc.candidates) else {}),
+                **({"candidate_bssid_count": len(acc.candidates_seen), "candidate_count_is_lower_bound": True}
+                   if acc.candidates_capped else
+                   {"candidate_bssid_count": len(acc.candidates_seen)}
+                   if len(acc.candidates_seen) > len(acc.candidates) else {}),
             }
         return out
 

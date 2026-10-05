@@ -14,6 +14,7 @@ never claim that an attack succeeded or that a handshake was obtained.
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,6 +41,7 @@ SUMMARIES = {
 CORE_DEAUTH = ("deauth_burst", "broadcast_deauth")
 MAX_TRACKED = 1024      # stations / rogue BSSIDs remembered per incident and per BSSID
 MAX_INCIDENTS = 4096
+MAX_RECENT_BSSIDS = 4096  # BSSIDs with remembered disconnects / re-authentications
 SPOOF_STRONG = {"security_downgrade", "incompatible_duplicate", "pmf_downgrade", "encryption_change"}
 
 
@@ -98,9 +100,34 @@ class CorrelationEngine:
         self.config = config
         self.ctx = ctx
         self.escalation = config.alerts.escalation_delta
-        self.incidents: dict[str, Incident] = {}
-        self.recent_disconnects: dict[str, dict[str, float]] = {}   # bssid -> station -> ts
-        self.recent_reauth: dict[str, dict[str, tuple[float, float]]] = {}  # bssid -> sta -> (ts, delay)
+        # All bounded when entries are added (least recently used first; protected networks and
+        # registered BSSIDs are kept), so a flood of random BSSIDs cannot grow them even when
+        # timestamps do not advance and idle expiry never runs.
+        self.incidents: OrderedDict[str, Incident] = OrderedDict()
+        self.recent_disconnects: OrderedDict[str, dict[str, float]] = OrderedDict()   # bssid -> sta -> ts
+        self.recent_reauth: OrderedDict[str, dict[str, tuple[float, float]]] = OrderedDict()  # -> (ts, delay)
+
+    def _registered(self, bssid: str | None) -> bool:
+        return bool(bssid) and self.ctx.registry.by_bssid(bssid) is not None
+
+    def _recent(self, book: OrderedDict, bssid: str) -> dict:
+        inner = book.get(bssid)
+        if inner is None:
+            inner = book[bssid] = {}
+            if len(book) > MAX_RECENT_BSSIDS:
+                victim = next((b for b in book if b != bssid and not self._registered(b)), None)
+                del book[victim if victim is not None else next(iter(book))]
+        else:
+            book.move_to_end(bssid)
+        return inner
+
+    def _store_incident(self, key: str, inc: Incident) -> None:
+        self.incidents[key] = inc
+        self.incidents.move_to_end(key)
+        if len(self.incidents) > MAX_INCIDENTS:
+            victim = next((k for k, i in self.incidents.items()
+                           if k != key and i.network is None and not self._registered(i.bssid)), None)
+            del self.incidents[victim if victim is not None else next(iter(self.incidents))]
 
     # -- individual findings -----------------------------------------------------------
     def finding_alert(self, f: Finding) -> Alert:
@@ -129,11 +156,16 @@ class CorrelationEngine:
         if inc is not None and f.timestamp - inc.last_update > self.cfg.window:
             del self.incidents[key[0]]
             inc = None
-        if inc is None:
+        if inc is not None:
+            self.incidents.move_to_end(key[0])
+        else:
             if key[1] == "bssid" and f.category not in DEAUTH_CATEGORIES:
                 # EAPOL/baseline findings join, but do not open, disconnect incidents
-                pending = self.incidents.setdefault(f"pending:{key[0]}", Incident(
-                    key[0], "pending", f.timestamp, f.timestamp, bssid=f.bssid))
+                pkey = f"pending:{key[0]}"
+                pending = self.incidents.get(pkey)
+                if pending is None:
+                    pending = Incident(key[0], "pending", f.timestamp, f.timestamp, bssid=f.bssid)
+                self._store_incident(pkey, pending)
                 pending.add(f)
                 return None
             inc = Incident(key[0], key[1], f.timestamp, f.timestamp, network=f.network,
@@ -145,7 +177,7 @@ class CorrelationEngine:
                     inc.sources.setdefault(cat, set()).update(pending.sources.get(cat, ()))
             if key[1] == "bssid":
                 self._import_recent(inc, f.timestamp)
-            self.incidents[key[0]] = inc
+            self._store_incident(key[0], inc)
         return inc
 
     def _activity_start(self, inc: Incident) -> float:
@@ -184,7 +216,7 @@ class CorrelationEngine:
             return []
         ts = ev.timestamp
         if ev.event_type in DISCONNECT_TYPES:
-            book = self.recent_disconnects.setdefault(ev.bssid, {})
+            book = self._recent(self.recent_disconnects, ev.bssid)
             targets = [ev.station] if ev.station else (
                 sorted(self.ctx.stations.associated(ev.bssid, ts)) if ev.broadcast else [])
             for sta in targets:
@@ -199,7 +231,7 @@ class CorrelationEngine:
         if ev.event_type is EventType.EAPOL and ev.station:
             disc = self.recent_disconnects.get(ev.bssid, {}).get(ev.station)
             if disc is not None and 0 <= ts - disc <= self.cfg.reconnect_window:
-                self.recent_reauth.setdefault(ev.bssid, {}).setdefault(ev.station, (ts, ts - disc))
+                self._recent(self.recent_reauth, ev.bssid).setdefault(ev.station, (ts, ts - disc))
                 inc = self.incidents.get(f"bssid:{ev.bssid}")
                 if inc is not None and ev.station not in inc.reauth:
                     inc.reauth[ev.station] = round(ts - disc, 2)
@@ -325,8 +357,5 @@ class CorrelationEngine:
     def expire(self, now: float) -> None:
         for key in [k for k, i in self.incidents.items() if now - i.last_update > self.cfg.window * 2]:
             del self.incidents[key]
-        if len(self.incidents) > MAX_INCIDENTS:  # a flood of random BSSIDs: keep the most active
-            keep = sorted(self.incidents.items(), key=lambda kv: kv[1].last_update)[-MAX_INCIDENTS:]
-            self.incidents = dict(keep)
         for bssid in set(self.recent_disconnects) | set(self.recent_reauth):
             self._prune(bssid, now)

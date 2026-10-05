@@ -114,9 +114,12 @@ K = TypeVar("K", bound=Hashable)
 
 
 class KeyedState(Generic[K, T]):
-    """Lazily created per-key state with idle eviction and at most ``max_keys`` keys: the least
-    recently used key is dropped first, except keys for which ``keep`` is true (registered
-    BSSIDs), so a flood of random BSSIDs cannot grow it or push out the protected network."""
+    """Lazily created per-key state with idle eviction and at most ``max_keys`` keys.
+
+    Keys for which ``keep`` is true (registered BSSIDs, or stations of a registered BSSID)
+    have their own least-recently-used order and are dropped only when no other key is
+    left, so a flood of random keys cannot push them out; both orders are O(1).
+    """
 
     def __init__(self, factory: Callable[[], T], idle_timeout: float = 3600.0, *, max_keys: int = 4096,
                  keep: Callable[[K], bool] | None = None):
@@ -125,25 +128,25 @@ class KeyedState(Generic[K, T]):
         self.max_keys = max_keys
         self.keep = keep
         self._state: dict[K, T] = {}
-        self._seen: OrderedDict[K, float] = OrderedDict()
+        self._seen: OrderedDict[K, float] = OrderedDict()   # other keys, least recently used first
+        self._kept: OrderedDict[K, float] = OrderedDict()   # keys for which keep() was true
 
     def get(self, key: K, now: float) -> T:
         st = self._state.get(key)
         if st is None:
             st = self._state[key] = self.factory()
-            self._seen[key] = now
+            order = self._kept if self.keep is not None and self.keep(key) else self._seen
+            order[key] = now
             if len(self._state) > self.max_keys:
-                self._evict_one(key)
+                victims = self._seen if len(self._seen) > (order is self._seen) else self._kept
+                victim = next(k for k in victims if k != key)
+                del victims[victim]
+                del self._state[victim]
         else:
-            self._seen[key] = now
-            self._seen.move_to_end(key)
+            order = self._kept if key in self._kept else self._seen
+            order[key] = now
+            order.move_to_end(key)
         return st
-
-    def _evict_one(self, newest: K) -> None:
-        victim = next((k for k in self._seen if k != newest and not (self.keep and self.keep(k))), None)
-        if victim is not None:
-            del self._seen[victim]
-            self._state.pop(victim, None)
 
     def peek(self, key: K) -> T | None:
         return self._state.get(key)
@@ -152,10 +155,11 @@ class KeyedState(Generic[K, T]):
         return self._state.items()
 
     def evict_idle(self, now: float) -> int:
-        stale = [k for k, t in self._seen.items() if now - t > self.idle_timeout]
+        stale = [k for order in (self._seen, self._kept) for k, t in order.items() if now - t > self.idle_timeout]
         for k in stale:
             self._state.pop(k, None)
             self._seen.pop(k, None)
+            self._kept.pop(k, None)
         return len(stale)
 
     def __len__(self) -> int:
