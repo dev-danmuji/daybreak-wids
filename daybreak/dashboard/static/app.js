@@ -29,10 +29,19 @@ function fmtTime(ts) {
   return d.toLocaleString(undefined, { hour12: false });
 }
 
+// A request that never completes (e.g. the server was stopped) must not stall the poll loop.
+const FETCH_TIMEOUT_MS = 15000;
+
 async function getJSON(path) {
-  const r = await fetch(path, { cache: "no-store" });
-  if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
-  return r.json();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const r = await fetch(path, { cache: "no-store", signal: ctrl.signal });
+    if (!r.ok) throw new Error(`${path}: HTTP ${r.status}`);
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function replace(id, ...nodes) {
@@ -217,15 +226,32 @@ function renderBaseline(rows) {
   }));
 }
 
+function markStale(noteId, err) {
+  console.warn(err);
+  document.getElementById(noteId).textContent = "(update failed; showing the last data received)";
+}
+
 async function refreshAlertsAndTimeline() {
-  const t = await getJSON("/api/timeline?minutes=60");
-  renderTimeline(t);
-  let alerts = await getJSON("/api/alerts?hours=24&limit=100");
+  // Independent requests: a failing timeline must not leave the alerts table silently stale.
+  const [timeline, live] = await Promise.allSettled([
+    getJSON("/api/timeline?minutes=60"), getJSON("/api/alerts?hours=24&limit=100")]);
+  const t = timeline.status === "fulfilled" ? timeline.value : null;
+  if (t) renderTimeline(t); else markStale("timeline-note", timeline.reason);
+  if (live.status !== "fulfilled") {
+    markStale("alerts-note", live.reason);
+    return;
+  }
+  let alerts = live.value;
   let period = "last 24 h";
-  const recorded = t.anchor && t.anchor < Date.now() / 1000 - 120;
+  const recorded = t && t.anchor && t.anchor < Date.now() / 1000 - 120;
   if (!alerts.length && recorded) {
     // No live data: like the timeline, show the most recent recorded period (e.g. a replay).
-    alerts = await getJSON(`/api/alerts?hours=24&limit=100&until=${encodeURIComponent(t.anchor)}`);
+    try {
+      alerts = await getJSON(`/api/alerts?hours=24&limit=100&until=${encodeURIComponent(t.anchor)}`);
+    } catch (e) {
+      markStale("alerts-note", e);
+      return;
+    }
     period = `recorded data, 24 h up to ${fmtTime(t.anchor)}`;
   }
   renderAlerts(alerts, period);

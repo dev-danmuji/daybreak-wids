@@ -6,6 +6,8 @@ import dataclasses
 import ipaddress
 import math
 import os
+import re
+import socket
 import types
 import typing
 import urllib.parse
@@ -435,6 +437,62 @@ def is_loopback_host(host: str) -> bool:
         return False
 
 
+def _inet_aton(text: str) -> bytes | None:
+    try:
+        return socket.inet_aton(text)
+    except (OSError, ValueError):
+        return None
+
+
+def is_unspecified_host(host: str) -> bool:
+    """True for the all-interfaces address in any spelling ('', 0.0.0.0, ::, [::], ::0, 0, ...)."""
+    bare = host.strip().strip("[]")
+    if not bare:
+        return True
+    try:
+        return ipaddress.ip_address(bare).is_unspecified
+    except ValueError:
+        return _inet_aton(bare) == bytes(4)
+
+
+def is_noncanonical_ip(host: str) -> bool:
+    """A legacy IPv4 spelling (``127.1``, ``0x7f000001``, ``000.000.000.000``): the resolver
+    accepts it, but it is not what a browser sends as Host."""
+    bare = host.strip().strip("[]")
+    try:
+        ipaddress.ip_address(bare)
+        return False
+    except ValueError:
+        return _inet_aton(bare) is not None
+
+
+_HOST_LABEL = re.compile(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?")
+
+
+def normalize_allowed_host(host: Any) -> str:
+    """One ``dashboard.allowed_hosts`` entry: a literal host name or IP address, lower-case,
+    no port and no wildcard (``*`` would switch the DNS-rebinding check off)."""
+    if not isinstance(host, str) or not host.strip():
+        raise ConfigError(f"dashboard.allowed_hosts: invalid host name {host!r}")
+    name = host.strip().lower()
+    if "*" in name:
+        raise ConfigError(f"dashboard.allowed_hosts: {host!r}: wildcards are not supported; list each host "
+                          "name or address typed in the browser")
+    bare = name[1:-1] if name.startswith("[") and name.endswith("]") else name
+    try:
+        return str(ipaddress.ip_address(bare))
+    except ValueError:
+        pass
+    if ":" in name:
+        raise ConfigError(f"dashboard.allowed_hosts: {host!r}: give the host name or address without a port")
+    if is_noncanonical_ip(name):
+        raise ConfigError(f"dashboard.allowed_hosts: {host!r}: write the IPv4 address in dotted-quad form")
+    labels = name[:-1].split(".") if name.endswith(".") else name.split(".")
+    if len(name) > 253 or not all(_HOST_LABEL.fullmatch(label) for label in labels):
+        raise ConfigError(f"dashboard.allowed_hosts: invalid host name {host!r}")
+    return name
+
+
 def _validate(cfg: Config) -> None:
     enforce_passive(cfg.safety)
     if not cfg.sensor.interface:
@@ -490,11 +548,11 @@ def _validate(cfg: Config) -> None:
     if cfg.storage.retention_days < 0:
         raise ConfigError("storage.retention_days must be >= 0 (0 keeps data forever)")
     _validate_kismet_url(cfg.backend.kismet.url)
+    if is_noncanonical_ip(cfg.dashboard.host):
+        raise ConfigError(f"dashboard.host: write {cfg.dashboard.host!r} as a canonical IP address (e.g. 127.0.0.1)")
     if not is_loopback_host(cfg.dashboard.host) and not cfg.dashboard.allow_remote:
         raise ConfigError("dashboard.host must be a loopback address unless dashboard.allow_remote is true")
-    for host in cfg.dashboard.allowed_hosts:
-        if not isinstance(host, str) or not host.strip() or any(c in host for c in " /@"):
-            raise ConfigError(f"dashboard.allowed_hosts: invalid host name {host!r}")
+    cfg.dashboard.allowed_hosts = list(dict.fromkeys(normalize_allowed_host(h) for h in cfg.dashboard.allowed_hosts))
     names = [n.name for n in cfg.protected_networks]
     dupes = {n for n in names if names.count(n) > 1}
     if dupes:

@@ -50,8 +50,10 @@ class StorageBudget:
 
 # Stored per (event type, BSSID): a burst of 500, then 50 per second.
 EVENT_STORAGE_RATE, EVENT_STORAGE_BURST = 50.0, 500.0
-# New database rows for unregistered BSSIDs advertising a protected SSID: 256 per SSID and hour.
+# New database rows for unregistered BSSIDs: 256 per SSID and hour, and 1024 per hour over all
+# SSIDs (with detection.scope "all", a flood of random SSIDs would otherwise get 256 each).
 UNKNOWN_AP_ROWS_PER_HOUR = 256
+UNKNOWN_AP_ROWS_TOTAL_PER_HOUR = 1024
 MAX_AP_WRITE_KEYS = 8192
 
 
@@ -145,6 +147,7 @@ class Pipeline:
         self._ap_written: OrderedDict[tuple[str, str], tuple[float, Any, int | None]] = OrderedDict()
         self._event_budget = StorageBudget(EVENT_STORAGE_RATE, EVENT_STORAGE_BURST)
         self._unknown_ap_budget = StorageBudget(UNKNOWN_AP_ROWS_PER_HOUR / 3600.0, UNKNOWN_AP_ROWS_PER_HOUR)
+        self._unknown_ap_total = StorageBudget(UNKNOWN_AP_ROWS_TOTAL_PER_HOUR / 3600.0, UNKNOWN_AP_ROWS_TOTAL_PER_HOUR)
         self._last_flush = time.monotonic()
         self._last_expire: float | None = None
         self.last_event_ts: float | None = None
@@ -261,9 +264,10 @@ class Pipeline:
         if last and ev.timestamp - last[0] < 60.0 and last[1] == sec and last[2] == ev.channel:
             return
         authorized = self.registry.is_authorized(ev.ssid, ev.bssid)
-        if last is None and authorized is not True and \
-                not self._unknown_ap_budget.allow(ev.ssid or "", ev.timestamp):
-            self.stats["aps_not_stored"] += 1  # beacon flood with random BSSIDs: keep a sample
+        if last is None and authorized is not True and not (
+                self._unknown_ap_budget.allow(ev.ssid or "", ev.timestamp)
+                and self._unknown_ap_total.allow(None, ev.timestamp)):
+            self.stats["aps_not_stored"] += 1  # beacon flood with random BSSIDs / SSIDs: keep a sample
             return
         self._ap_written[key] = (ev.timestamp, sec, ev.channel)
         self._ap_written.move_to_end(key)

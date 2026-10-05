@@ -4,7 +4,8 @@ All endpoints are GET and read the SQLite database / monitor status file; each
 response is built from an explicit field allow-list. Requests are accepted only
 for allowed Host names (DNS-rebinding protection): the loopback names, a
 loopback bind address, and, with ``dashboard.allow_remote``, the bind address
-and ``dashboard.allowed_hosts``. There is no authentication.
+and ``dashboard.allowed_hosts`` (literal names, no wildcards). At most
+``MAX_IN_FLIGHT`` requests are handled at once. There is no authentication.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import __version__
-from ..config import Config, is_loopback_host
+from ..config import Config, is_loopback_host, is_noncanonical_ip, is_unspecified_host
 from ..detectors.security import audit_network, observations_from_rows
 from ..models import Severity
 from ..monitor import read_status, status_path
@@ -32,10 +33,10 @@ from ..storage import Database
 
 STATIC = Path(__file__).parent / "static"
 LOOPBACK_HOSTS = ["127.0.0.1", "localhost", "[::1]"]
-WILDCARD_HOSTS = {"", "0.0.0.0", "::"}
 KNOWN_ADAPTERS = {"0e8d:7961": "MediaTek MT7921U"}
 EVENT_TYPES = ["deauth", "disassoc", "eapol", "auth", "assoc", "reassoc"]
 UNKNOWN_BSSID_LIMIT = 50
+MAX_IN_FLIGHT = 16  # concurrent requests; more get a 503 (idle connections do not count)
 SECURITY_HEADERS = {
     "Content-Security-Policy": (
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
@@ -45,8 +46,8 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store",
 }
-ALERT_FIELDS = ("id", "timestamp", "severity", "alert_type", "score", "bssid", "summary",
-                "suppressed_count", "acknowledged")
+ALERT_FIELDS = ("id", "timestamp", "severity", "alert_type", "score", "bssid", "suppressed_count",
+                "acknowledged")
 NETWORK_FIELDS = ("network", "ssid", "status", "mode", "transition_mode", "pmf", "pmf_required", "wps",
                   "aps", "items", "recommendations", "worst_level")
 
@@ -119,7 +120,7 @@ def host_header_name(host: str) -> str:
 def allowed_hosts(config: Config, bind_host: str | None = None, *, allow_remote: bool = False) -> list[str]:
     hosts = list(LOOPBACK_HOSTS)
     bind = (config.dashboard.host if bind_host is None else bind_host).strip()
-    if bind.strip("[]") not in WILDCARD_HOSTS and (allow_remote or is_loopback_host(bind)):
+    if not is_unspecified_host(bind) and (allow_remote or is_loopback_host(bind)):
         hosts.append(host_header_name(bind))
     if allow_remote:
         hosts += [host_header_name(h) for h in config.dashboard.allowed_hosts]
@@ -132,24 +133,32 @@ def create_app(config: Config, *, allow_remote: bool = False, bind_host: str | N
     app.add_middleware(TrustedHostMiddleware,
                        allowed_hosts=allowed_hosts(config, bind_host, allow_remote=allow_remote))
 
+    in_flight = 0
+
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
-        if request.method not in ("GET", "HEAD"):
-            response = JSONResponse({"detail": "read-only dashboard"}, status_code=405,
-                                    headers={"Allow": "GET, HEAD"})
+        nonlocal in_flight
+        if request.method != "GET":
+            response = JSONResponse({"detail": "read-only dashboard"}, status_code=405, headers={"Allow": "GET"})
+        elif in_flight >= MAX_IN_FLIGHT:
+            response = JSONResponse({"detail": "busy"}, status_code=503, headers={"Retry-After": "1"})
         else:
+            in_flight += 1
             try:
                 response = await call_next(request)
             except Exception:  # no traceback to the client, and keep the security headers
                 log.exception("dashboard request failed")
                 response = JSONResponse({"detail": "internal error"}, status_code=500)
+            finally:
+                in_flight -= 1
         response.headers.update(SECURITY_HEADERS)
         return response
 
     @app.exception_handler(DatabaseUnavailable)
     async def database_unavailable(request: Request, exc: DatabaseUnavailable) -> JSONResponse:  # noqa: ARG001
-        return JSONResponse({"detail": "the database cannot be read by the dashboard process "
-                                       "(written by another user? see README: file locations)"},
+        return JSONResponse({"detail": "the database cannot be read by the dashboard process (written "
+                                       "by another user, or not a current daybreak-wids database? see "
+                                       "README: file locations)"},
                             status_code=503)
 
     def db_or_none() -> Database | None:
@@ -170,7 +179,7 @@ def create_app(config: Config, *, allow_remote: bool = False, bind_host: str | N
         if db is not None:
             try:
                 last5 = db.event_counts(since=now - 300)
-                recent = db.list_alerts(since=now - 300, limit=200)
+                recent = db.list_alerts(since=now - 300, limit=200, with_reason=False)
                 sensor_rows = db.latest_sensor_status(limit=5)
             finally:
                 db.close()
@@ -194,7 +203,7 @@ def create_app(config: Config, *, allow_remote: bool = False, bind_host: str | N
         out = []
         try:
             for net in config.protected_networks:
-                rows = db.list_aps(ssid=net.ssid, limit=UNKNOWN_BSSID_LIMIT + len(net.bssids)) if db else []
+                rows = db.list_aps(ssid=net.ssid, registered=net.bssids, limit=UNKNOWN_BSSID_LIMIT) if db else []
                 unknown = db.count_aps(ssid=net.ssid, exclude_bssids=net.bssids) if db else 0
                 audit = audit_network(net, observations_from_rows(rows), unknown_total=unknown).to_dict()
                 view = {k: audit[k] for k in NETWORK_FIELDS}
@@ -243,7 +252,7 @@ def create_app(config: Config, *, allow_remote: bool = False, bind_host: str | N
             counts = db.event_buckets(since=start, until=end, bucket=60, event_types=EVENT_TYPES)
             series = [{"t": start + i * 60, **counts.get(i, {})} for i in range(minutes)]
             alerts = [{"t": a["timestamp"], "severity": a["severity"], "type": a["alert_type"], "score": a["score"]}
-                      for a in db.list_alerts(since=start, until=end, limit=500)]
+                      for a in db.list_alerts(since=start, until=end, limit=500, with_reason=False)]
             return {"anchor": end, "start": start, "buckets": series, "alerts": alerts}
         finally:
             db.close()
@@ -285,14 +294,17 @@ def is_loopback(host: str) -> bool:
 def serve(config: Config, *, host: str, port: int, allow_remote: bool = False) -> None:
     import uvicorn
 
+    if is_noncanonical_ip(host):
+        raise ValueError(f"refusing dashboard host {host!r}: write it as a canonical IP address (e.g. 127.0.0.1)")
     if not is_loopback(host):
         if not allow_remote:
             raise ValueError(f"refusing to bind the dashboard to {host}: set dashboard.allow_remote to expose it")
-        if host.strip().strip("[]") in WILDCARD_HOSTS and not config.dashboard.allowed_hosts:
+        if is_unspecified_host(host) and not config.dashboard.allowed_hosts:
             raise ValueError(f"binding the dashboard to {host!r} needs dashboard.allowed_hosts: the host names "
                              "or addresses you will type in the browser (Host-header allow-list)")
         print(f"WARNING: the dashboard has no authentication; anyone who can reach {host}:{port} can read "
               "alerts, MAC addresses and network names", file=sys.stderr)
+        print("Accepted Host names: " + ", ".join(allowed_hosts(config, host, allow_remote=True)), file=sys.stderr)
     print(f"daybreak-wids dashboard on http://{host_header_name(host)}:{port}/ (read-only; Ctrl-C to stop)")
     uvicorn.run(create_app(config, allow_remote=allow_remote, bind_host=host), host=host.strip().strip("[]"),
-                port=port, log_level="warning", limit_concurrency=32)
+                port=port, log_level="warning")

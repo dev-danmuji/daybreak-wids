@@ -94,7 +94,7 @@ def test_security_headers_on_error_responses(client, monkeypatch):
 
     _, c = client
     r = c.post("/api/status")
-    assert r.status_code == 405 and r.headers["allow"] == "GET, HEAD"
+    assert r.status_code == 405 and r.headers["allow"] == "GET"
     assert "default-src 'self'" in r.headers["content-security-policy"]
     assert r.headers["x-content-type-options"] == "nosniff" and r.headers["cache-control"] == "no-store"
     rejected = TestClient(c.app, base_url="http://attacker.example").get("/")
@@ -135,6 +135,7 @@ def test_api_views_do_not_expose_internals(tmp_path):
     assert c.get("/api/status").json()["monitor"]["backend"] == {"name": "kismet", "healthy": False}
     alerts = c.get("/api/alerts", params={"hours": 24 * 365}).json()
     assert alerts and all(set(a["reason"]) == {"components"} for a in alerts)
+    assert all("summary" not in a for a in alerts)  # unused by the UI; may name a station
 
 
 def test_alerts_of_a_recorded_period(tmp_path):

@@ -22,7 +22,9 @@ from ..detectors.base import (
     DEAUTH_CATEGORIES, POSSIBLE_DEAUTH_ATTACK, POSSIBLE_EVIL_TWIN,
     POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT, SPOOF_CATEGORIES, DetectionContext,
 )
-from ..models import DISCONNECT_TYPES, Alert, Event, EventType, Finding, ScoreComponent
+from ..models import (
+    DISCONNECT_TYPES, MAX_ALERT_LIST, Alert, Event, EventType, Finding, ScoreComponent,
+)
 
 SUMMARIES = {
     POSSIBLE_DEAUTH_ATTACK:
@@ -307,7 +309,10 @@ class CorrelationEngine:
                 details["reauthenticated_stations"] = len(inc.reauth)
             stations = tuple(sorted(inc.disconnected))
         else:
-            details["rogue_bssids"] = sorted(inc.rogue_bssids)
+            rogue = sorted(inc.rogue_bssids)
+            details["rogue_bssids"] = rogue[:MAX_ALERT_LIST]
+            if len(rogue) > MAX_ALERT_LIST:
+                details["rogue_bssid_count"] = len(rogue)
             stations = ()
         details["evidence"] = sorted(t for s in inc.sources.values() for t in s)
         return [Alert(

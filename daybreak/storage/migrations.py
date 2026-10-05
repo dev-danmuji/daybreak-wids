@@ -108,9 +108,15 @@ MIGRATIONS: list[tuple[int, str, str]] = [
         CREATE INDEX idx_sensor_status_ts ON sensor_status (timestamp);
         CREATE INDEX idx_baselines_active ON baselines (network_id, active);
     """),
+    (3, "AP lookups by SSID", """
+        CREATE INDEX idx_aps_ssid_last_seen ON aps (ssid, last_seen);
+    """),
 ]
 
 LATEST_VERSION = MIGRATIONS[-1][0]
+# Oldest schema the read-only paths (dashboard) can query; raise it when a migration adds
+# columns or tables they select.
+READ_COMPATIBLE_FROM = 2
 
 
 class MigrationError(RuntimeError):

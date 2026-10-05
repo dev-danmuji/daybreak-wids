@@ -740,8 +740,15 @@ class Finding:
         return ScoreComponent(self.points, self.label, self.detail, self.category)
 
 
+# Stations / rogue BSSIDs listed in a stored or logged alert (the full count is kept).
+MAX_ALERT_LIST = 64
+
+
 @dataclass
 class Alert:
+    """``stations`` holds every affected station; stored and logged forms list at most
+    ``MAX_ALERT_LIST`` of them plus ``stations_total`` (a random-MAC flood stays small)."""
+
     alert_type: str
     timestamp: float
     score: int
@@ -774,12 +781,19 @@ class Alert:
     def score_lines(self) -> list[str]:
         return [c.render() for c in self.components]
 
+    def _station_fields(self) -> dict[str, Any]:
+        listed = sorted(self.stations)[:MAX_ALERT_LIST]
+        fields: dict[str, Any] = {"stations": listed}
+        if len(self.stations) > len(listed):
+            fields["stations_total"] = len(self.stations)
+        return fields
+
     def reason_dict(self) -> dict[str, Any]:
         return {
             "summary": self.summary,
             "components": [c.to_dict() for c in self.components],
             "details": self.details,
-            "stations": list(self.stations),
+            **self._station_fields(),
             "bssid": self.bssid,
             "ssid": self.ssid,
             "channel": self.channel,
@@ -799,7 +813,7 @@ class Alert:
             "ssid": self.ssid,
             "channel": self.channel,
             "sensor": self.sensor,
-            "stations": list(self.stations),
+            **self._station_fields(),
             "score_breakdown": [c.render() for c in self.components],
             "details": self.details,
             "suppressed_since_last": self.suppressed_count,

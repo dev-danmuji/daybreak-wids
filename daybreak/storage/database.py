@@ -12,7 +12,10 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from ..fileperm import private_dir, secure_path
 from ..models import Alert, Event, EventType, Severity, clean_text, sanitize_metadata
-from .migrations import migrate
+from .migrations import LATEST_VERSION, READ_COMPATIBLE_FROM, migrate
+
+
+REQUIRED_TABLES = frozenset({"aps", "alerts", "baselines", "events", "networks", "sensor_status", "stations"})
 
 
 def _dumps(value: Any) -> str:
@@ -49,25 +52,43 @@ class Database:
 
     @staticmethod
     def _connect_readonly(path: Path) -> sqlite3.Connection:
-        """Open without ever writing (no WAL switch, no migration, no file creation).
+        """Open without modifying the database (no WAL switch, no migration). SQLite may
+        still create the ``-wal``/``-shm`` sidecar files next to it.
 
         ``Path.as_uri`` percent-encodes the path, so names with ``%``, ``#`` or ``?``
         cannot turn into a different (writable) URI. A WAL database whose ``-shm``
         file is gone, in a directory this user cannot write (a root-run monitor that
         has stopped), cannot be opened plainly read-only; it is then opened
-        ``immutable``, which is accurate once no writer has a WAL pending.
+        ``immutable``, but only when no ``-wal`` content is pending (immutable would
+        silently ignore it and show old data). The schema is checked so an empty or
+        foreign file is reported instead of failing every query.
         """
-        base = path.resolve().as_uri()
+        resolved = path.resolve()
+        base = resolved.as_uri()
+        queries = ["?mode=ro"]
+        try:
+            pending = resolved.with_name(resolved.name + "-wal").stat().st_size > 0
+        except FileNotFoundError:
+            pending = False
+        except OSError:
+            pending = True  # cannot tell: never risk showing old data
+        if not pending:
+            queries.append("?mode=ro&immutable=1")
         error: sqlite3.Error | None = None
-        for query in ("?mode=ro", "?mode=ro&immutable=1"):
+        for query in queries:
             conn = sqlite3.connect(base + query, uri=True, timeout=10, check_same_thread=False,
                                    isolation_level=None)
             try:
-                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
-                return conn
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+                tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             except sqlite3.Error as exc:
                 conn.close()
                 error = exc
+                continue
+            if not READ_COMPATIBLE_FROM <= version <= LATEST_VERSION or not REQUIRED_TABLES <= tables:
+                conn.close()
+                raise sqlite3.DatabaseError(f"not a daybreak-wids database this version can read (schema v{version})")
+            return conn
         assert error is not None
         raise error
 
@@ -272,11 +293,13 @@ class Database:
         )
 
     def list_aps(self, *, ssid: str | None = None, network_id: int | None = None,
-                 limit: int | None = None) -> list[dict[str, Any]]:
+                 registered: Sequence[str] = (), limit: int | None = None) -> list[dict[str, Any]]:
         """APs ordered by SSID, registered first, then BSSID.
 
-        With ``limit``, registered APs and then the most recently seen others are kept
-        (a beacon flood with random BSSIDs cannot make the result unbounded).
+        With ``limit``, every ``registered`` BSSID is returned plus at most ``limit`` of the
+        most recently seen others (a beacon flood with random BSSIDs cannot make the result
+        unbounded, nor push a registered AP out of it). ``registered`` is the configuration's
+        list, not the stored ``authorized`` flag, which can predate a ``network add``.
         """
         sql = "SELECT * FROM aps WHERE 1=1"
         params: list[Any] = []
@@ -287,9 +310,17 @@ class Database:
             sql += " AND network_id = ?"
             params.append(network_id)
         if limit:
-            sql += " ORDER BY COALESCE(authorized, 0) DESC, last_seen DESC LIMIT ?"
-            params.append(int(limit))
-            rows = sorted(self._query(sql, params), key=lambda r: (r["ssid"], -(r["authorized"] or 0), r["bssid"]))
+            reg = list(dict.fromkeys(registered))
+            others, other_params = sql, list(params)
+            rows = []
+            if reg:
+                marks = ",".join("?" * len(reg))
+                rows = self._query(f"{sql} AND bssid IN ({marks})", [*params, *reg])
+                others += f" AND bssid NOT IN ({marks})"
+                other_params += reg
+            rows += self._query(others + " ORDER BY last_seen DESC LIMIT ?", [*other_params, int(limit)])
+            known = set(reg)
+            rows.sort(key=lambda r: (r["ssid"], r["bssid"] not in known, r["bssid"]))
         else:
             sql += " ORDER BY ssid, authorized DESC, bssid"
             rows = self._query(sql, params)
@@ -354,8 +385,12 @@ class Database:
 
     def list_alerts(self, *, since: float | None = None, until: float | None = None,
                     min_severity: Severity | None = None, alert_type: str | None = None,
-                    unacknowledged: bool = False, limit: int | None = 50) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM alerts WHERE 1=1"
+                    unacknowledged: bool = False, limit: int | None = 50,
+                    with_reason: bool = True) -> list[dict[str, Any]]:
+        """Newest first. ``with_reason=False`` skips loading and parsing ``reason_json``."""
+        sql = ("SELECT * FROM alerts WHERE 1=1" if with_reason else
+               "SELECT id, timestamp, severity, alert_type, score, bssid, suppressed_count, acknowledged "
+               "FROM alerts WHERE 1=1")
         params: list[Any] = []
         if since is not None:
             sql += " AND timestamp >= ?"
@@ -379,7 +414,8 @@ class Database:
         out = []
         for r in self._query(sql, params):
             d = dict(r)
-            d["reason"] = json.loads(d.pop("reason_json") or "{}")
+            if with_reason:
+                d["reason"] = json.loads(d.pop("reason_json") or "{}")
             out.append(d)
         return out
 

@@ -987,3 +987,213 @@ def test_smoke_script_backgrounds_sudo_itself():
     script = (Path(__file__).resolve().parents[1] / "scripts" / "hardware-smoke-test.sh").read_text()
     assert 'sudo "$DAYBREAK" -c "$CONFIG" monitor start --backend passive' in script
     assert "sdb monitor start" not in script  # a backgrounded shell function would ignore SIGINT
+
+
+# -- dashboard: Host names, bind addresses, bounded queries (fix verification, round 3) ---------------
+
+@pytest.mark.parametrize("entry", ["*", "*.lan", "*lan", "wids.lan:8765", "http://wids.lan", "a b", "user@wids.lan",
+                                   "127.1", "", "wids..lan", "-wids.lan", "[::1]:8765"])
+def test_allowed_hosts_must_be_literal_names(tmp_path, entry):
+    with pytest.raises(ConfigError, match="allowed_hosts"):
+        make_config(tmp_path, dashboard={"host": "0.0.0.0", "allow_remote": True, "allowed_hosts": [entry]})
+
+
+def test_allowed_hosts_are_normalised_and_still_exclusive(tmp_path):
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from daybreak.dashboard.app import create_app
+
+    cfg = make_config(tmp_path, dashboard={"host": "0.0.0.0", "allow_remote": True,
+                                           "allowed_hosts": ["WIDS.Lan", "[::1]", "192.168.1.10", "wids.lan"]})
+    assert cfg.dashboard.allowed_hosts == ["wids.lan", "::1", "192.168.1.10"]
+    app = create_app(cfg, allow_remote=True, bind_host="0.0.0.0")
+    assert TestClient(app, base_url="http://wids.lan:8765").get("/api/status").status_code == 200
+    for evil in ("http://evil.lan", "http://attacker.example:8765"):
+        assert TestClient(app, base_url=evil).get("/api/status").status_code == 400
+
+
+@pytest.mark.parametrize("host", ["0", "000.000.000.000", "127.1", "0x7f000001"])
+def test_noncanonical_dashboard_addresses_are_refused(tmp_path, host):
+    from daybreak.dashboard.app import serve
+
+    with pytest.raises(ConfigError, match="canonical"):
+        make_config(tmp_path, dashboard={"host": host, "allow_remote": True})
+    cfg = make_config(tmp_path, dashboard={"allow_remote": True, "allowed_hosts": ["wids.lan"]})
+    with pytest.raises(ValueError, match="canonical"):
+        serve(cfg, host=host, port=8765, allow_remote=True)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "[::]", "::0", "0:0:0:0:0:0:0:0", ""])
+def test_every_spelling_of_all_interfaces_needs_allowed_hosts(tmp_path, host):
+    from daybreak.config import is_unspecified_host
+    from daybreak.dashboard.app import LOOPBACK_HOSTS, allowed_hosts, serve
+
+    assert is_unspecified_host(host)
+    with pytest.raises(ValueError, match="allowed_hosts"):
+        serve(make_config(tmp_path, dashboard={"allow_remote": True}), host=host, port=8765, allow_remote=True)
+    cfg = make_config(tmp_path, dashboard={"allow_remote": True, "allowed_hosts": ["wids.lan"]})
+    assert allowed_hosts(cfg, host, allow_remote=True) == [*LOOPBACK_HOSTS, "wids.lan"]  # never the wildcard
+
+
+def test_dashboard_is_get_only_and_bounds_requests_in_flight(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")
+    import uvicorn
+    from fastapi.testclient import TestClient
+
+    import daybreak.dashboard.app as dash
+
+    c = TestClient(dash.create_app(make_config(tmp_path)), base_url="http://127.0.0.1")
+    r = c.head("/api/status")
+    assert r.status_code == 405 and r.headers["allow"] == "GET"
+    monkeypatch.setattr(dash, "MAX_IN_FLIGHT", 0)
+    r = c.get("/api/status")
+    assert r.status_code == 503 and r.headers["retry-after"] == "1"
+    assert "default-src 'self'" in r.headers["content-security-policy"]
+    seen = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw))
+    dash.serve(make_config(tmp_path), host="127.0.0.1", port=8765)
+    assert seen["host"] == "127.0.0.1" and "limit_concurrency" not in seen  # idle sockets cannot block it
+
+
+def test_registered_ap_is_listed_despite_a_stale_flag_and_a_flood(tmp_path):
+    pytest.importorskip("fastapi")
+    import time
+
+    from fastapi.testclient import TestClient
+
+    from conftest import HOME_BSSID
+    from daybreak.dashboard.app import create_app
+    from daybreak.models import Event
+
+    cfg = make_config(tmp_path)
+    db = Database(cfg.database_path)
+    t0 = time.time() - 600
+    weak = Event.from_dict({"ts": t0, "type": "beacon", "bssid": HOME_BSSID, "ssid": "ExampleSSID",
+                            "security": {"akms": ["PSK"], "pmf": "disabled"}}).security
+    # written while the network was not yet registered: authorized=0 in the row
+    db.upsert_ap(bssid=HOME_BSSID, ssid="ExampleSSID", network_id=None, authorized=False, channel=36,
+                 security=weak, phy=None, rssi=-40, timestamp=t0)
+    for i in range(60):  # more recently heard unregistered BSSIDs
+        db.upsert_ap(bssid=f"02:00:00:00:00:{i:02X}", ssid="ExampleSSID", network_id=None, authorized=False,
+                     channel=36, security=None, phy=None, rssi=-70, timestamp=t0 + 60 + i)
+    rows = db.list_aps(ssid="ExampleSSID", registered=[HOME_BSSID], limit=50)
+    assert rows[0]["bssid"] == HOME_BSSID and len(rows) == 51
+    db.close()
+    home = TestClient(create_app(cfg), base_url="http://127.0.0.1").get("/api/networks").json()[0]
+    assert home["mode"] == "WPA2-PSK" and HOME_BSSID in str(home["aps"])
+    assert home["unknown_bssid_count"] == 60 and len(home["unknown_bssids"]) <= 50
+
+
+def test_alerts_store_and_log_a_bounded_station_list(tmp_path):
+    from daybreak.alerts.formatting import human_text
+    from daybreak.models import MAX_ALERT_LIST, Alert, ScoreComponent
+
+    stations = tuple(f"10:00:00:00:{i >> 8 & 255:02X}:{i & 255:02X}" for i in range(5000))
+    a = Alert("MULTI_CLIENT_DEAUTH", 1_790_000_000.0, 40, [ScoreComponent(40, "x", "", "deauth")],
+              stations=stations, details={"rogue_bssids": ["02:00:00:00:00:01"], "rogue_bssid_count": 9})
+    for form in (a.reason_dict(), a.to_dict()):
+        assert len(form["stations"]) == MAX_ALERT_LIST and form["stations_total"] == 5000
+    db = Database(tmp_path / "a.db")
+    db.insert_alert(a)
+    assert db.conn.execute("SELECT length(reason_json) FROM alerts").fetchone()[0] < 4000
+    assert "Stations=5000" in human_text(a) and "(+8 more)" in human_text(a)
+    light = db.list_alerts(with_reason=False)
+    assert "reason" not in light[0] and light[0]["severity"] == "LOW"
+    db.close()
+
+
+def test_random_station_and_bssid_floods_keep_alert_rows_small(tmp_path):
+    from conftest import HOME_BSSID
+    from daybreak.models import Event, EventType
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path))
+    p = rt.pipeline
+    t0 = 1_790_000_000.0
+    for i in range(6000):  # 300 unicast deauths/s for 20 s, each to a new random station
+        p.process(Event.from_dict({"ts": t0 + i / 300, "type": "deauth", "bssid": HOME_BSSID, "src": HOME_BSSID,
+                                   "dst": f"02:10:00:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}",
+                                   "reason": 7, "seq": i % 4096}))
+    for i in range(3000):  # then beacons for the protected SSID from random BSSIDs
+        p.process(Event(t0 + 30 + i * 0.01, EventType.BEACON, ssid="ExampleSSID", channel=36,
+                        bssid=f"02:20:00:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}"))
+    p.flush()
+    sizes = dict(rt.db.conn.execute("SELECT alert_type, MAX(length(reason_json)) FROM alerts GROUP BY alert_type"))
+    assert {"MULTI_CLIENT_DEAUTH", "POSSIBLE_DEAUTH_ATTACK"} <= set(sizes)
+    assert max(sizes.values()) < 8000, sizes
+    rt.close()
+
+
+def test_random_ssid_flood_is_bounded_and_ap_lookups_use_an_index(tmp_path):
+    from daybreak.models import Event, EventType
+    from daybreak.pipeline import UNKNOWN_AP_ROWS_TOTAL_PER_HOUR
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path, detection={"scope": "all"}))
+    t0 = 1_790_000_000.0
+    for i in range(3000):  # 100 beacons/s for 30 s, each a new BSSID with a new SSID
+        rt.pipeline.process(Event(t0 + i * 0.01, EventType.BEACON, ssid=f"rnd-{i}", channel=36,
+                                  bssid=f"02:30:00:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}"))
+    rt.pipeline.flush()
+    rows = rt.db.conn.execute("SELECT COUNT(*) FROM aps").fetchone()[0]
+    assert rows <= UNKNOWN_AP_ROWS_TOTAL_PER_HOUR + 30 * UNKNOWN_AP_ROWS_TOTAL_PER_HOUR / 3600 + 1
+    assert rt.pipeline.stats["aps_not_stored"] == 3000 - rows
+    plan = " ".join(str(r[-1]) for r in rt.db.conn.execute(
+        "EXPLAIN QUERY PLAN SELECT * FROM aps WHERE ssid = ? AND bssid NOT IN (?) ORDER BY last_seen DESC LIMIT 50",
+        ("ExampleSSID", "AA:BB:CC:DD:EE:FF")))
+    assert "idx_aps_ssid_last_seen" in plan
+    rt.close()
+
+
+def test_readonly_open_reports_empty_foreign_or_pending_databases(tmp_path):
+    import sqlite3
+
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from daybreak.dashboard.app import create_app
+
+    empty = tmp_path / "empty.db"
+    empty.write_bytes(b"")
+    foreign = tmp_path / "foreign.db"
+    with sqlite3.connect(foreign) as conn:
+        conn.execute("CREATE TABLE notes (x)")
+    for path in (empty, foreign):
+        with pytest.raises(sqlite3.DatabaseError, match="daybreak-wids database"):
+            Database(path, readonly=True)
+    cfg = make_config(tmp_path, storage={"database": str(empty)})
+    c = TestClient(create_app(cfg), base_url="http://127.0.0.1")
+    assert c.get("/api/status").json()["database"] == "unreadable"
+    assert c.get("/api/alerts").status_code == 503 and c.get("/api/networks").status_code == 503
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_readonly_open_never_serves_old_data_while_a_wal_is_pending(tmp_path):
+    import shutil
+    import sqlite3
+
+    src = tmp_path / "live"
+    db = Database(src / "w.db")
+    db.conn.execute("PRAGMA wal_autocheckpoint = 0")
+    db.sync_networks(make_config(tmp_path).protected_networks)  # committed, but only in w.db-wal
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    for name in ("w.db", "w.db-wal"):  # as left by a root monitor that died: no -shm, directory not writable
+        shutil.copy(src / name, snap / name)
+    db.close()
+    assert (snap / "w.db-wal").stat().st_size > 0
+    clean = tmp_path / "clean"  # after a clean stop everything is checkpointed into w.db
+    clean.mkdir()
+    shutil.copy(src / "w.db", clean / "w.db")
+    for d in (snap, clean):
+        d.chmod(0o555)
+    try:
+        with pytest.raises(sqlite3.Error):
+            Database(snap / "w.db", readonly=True)
+        ro = Database(clean / "w.db", readonly=True)  # nothing pending: the immutable fallback is accurate
+        assert [n["name"] for n in ro.list_networks()] == ["home", "lab"]
+        ro.close()
+    finally:
+        for d in (snap, clean):
+            d.chmod(0o755)

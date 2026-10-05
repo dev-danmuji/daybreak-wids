@@ -38,7 +38,8 @@ def human_lines(alert: Alert) -> list[str]:
     if d.get("reauthenticated_stations"):
         lines.append(f"ReauthenticatedStations={d['reauthenticated_stations']}")
     if d.get("rogue_bssids"):
-        lines.append(f"RogueBSSIDs={','.join(d['rogue_bssids'])}")
+        more = int(d.get("rogue_bssid_count") or 0) - len(d["rogue_bssids"])
+        lines.append(f"RogueBSSIDs={','.join(d['rogue_bssids'])}" + (f" (+{more} more)" if more > 0 else ""))
     if alert.sensor:
         lines.append(f"Sensor={alert.sensor}")
     lines += explain(alert.score, alert.components)
