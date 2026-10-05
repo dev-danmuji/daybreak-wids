@@ -63,3 +63,28 @@ def test_readme_example_output_is_real(cmd, body, tmp_path, monkeypatch):
         except ValueError:
             pytest.fail(f"README line not found (in order) in the real output: {line!r}\n"
                         f"--- real output ---\n{result.output}")
+
+
+COMMENT = re.compile(r"<!--.*?-->", re.S)
+IMAGE = re.compile(r"""<img\b[^>]*\bsrc=["']([^"']+)["']|!\[[^\]]*\]\(\s*([^)\s]+)""")
+FLOW_GIF = "docs/assets/daybreak-flow.gif"
+
+
+def shown_readme() -> str:
+    """README.md as GitHub renders it: HTML comments are not shown."""
+    return COMMENT.sub("", README.read_text(encoding="utf-8"))
+
+
+def test_every_image_the_readme_shows_exists():
+    for m in IMAGE.finditer(shown_readme()):
+        src = m.group(1) or m.group(2)
+        if "://" not in src:
+            assert (ROOT / src).is_file(), f"README.md shows {src}, which does not exist"
+
+
+def test_the_flow_animation_is_shown_once_it_is_rendered():
+    rendered = (ROOT / FLOW_GIF).is_file()
+    shown = FLOW_GIF in shown_readme()
+    assert shown == rendered, (
+        f"{FLOW_GIF} exists: remove the comment markers around it at the top of README.md" if rendered else
+        f"README.md shows {FLOW_GIF} before it was rendered (docs/animation/render.sh)")

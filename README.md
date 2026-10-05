@@ -9,6 +9,21 @@
 > Only use this project on wireless networks you own or have explicit
 > authorization to monitor.
 
+<!-- Animation, not rendered yet: run docs/animation/render.sh, then delete this line and the closing marker line below.
+<p align="center">
+  <img src="docs/assets/daybreak-flow.gif" alt="Animation with synthetic data: a deauthentication burst disconnects the clients of a protected access point, they reconnect and re-authenticate, and Daybreak's correlation engine adds the signals up to a HIGH POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT alert. Passive defensive monitoring only.">
+</p>
+<p align="center"><sub><a href="docs/assets/daybreak-flow.mp4">MP4 version</a> · source: <a href="docs/animation/">docs/animation/</a></sub></p>
+-->
+
+**How a detection is built** (synthetic example): a deauthentication burst
+disconnects several clients of a protected access point, the same clients
+reconnect and re-authenticate, and an EAPOL reauthentication surge follows.
+Daybreak's correlation engine adds these signals up into one explained alert,
+30 + 15 + 10 + 17 = 72, HIGH, `POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT` (the demo
+replay below has more signals and reaches 95, CRITICAL). The sensor only
+receives: no packet injection, no credential cracking.
+
 Daybreak WIDS monitors authorized Wi-Fi networks for suspicious deauthentication
 activity, abnormal EAPOL reauthentication, evil-twin indicators, security
 downgrade signals and related wireless anomalies. It only *receives* frames, and
