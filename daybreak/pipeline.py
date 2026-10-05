@@ -150,6 +150,7 @@ class Pipeline:
         self._unknown_ap_total = StorageBudget(UNKNOWN_AP_ROWS_TOTAL_PER_HOUR / 3600.0, UNKNOWN_AP_ROWS_TOTAL_PER_HOUR)
         self._last_flush = time.monotonic()
         self._last_expire: float | None = None
+        self._since_expire = 0
         self.last_event_ts: float | None = None
         self.last_error: str | None = None
         self.type_counts: Counter[str] = Counter()
@@ -202,10 +203,13 @@ class Pipeline:
             return []
         iface = ev.metadata.get("interface") or self.config.sensor.interface
         if self.db is not None:
-            self.db.record_sensor_status(sensor=ev.sensor, interface=iface,
-                                         status="ONLINE" if mapping[status] == SENSOR_RECOVERED else "LOST",
-                                         backend="replay", timestamp=ev.timestamp,
-                                         details={"source": "event"})
+            try:
+                self.db.record_sensor_status(sensor=ev.sensor, interface=iface,
+                                             status="ONLINE" if mapping[status] == SENSOR_RECOVERED else "LOST",
+                                             backend="replay", timestamp=ev.timestamp,
+                                             details={"source": "event"})
+            except (sqlite3.Error, ValueError) as exc:
+                self._storage_error(exc)
         return [sensor_alert(mapping[status], ev.timestamp, sensor=ev.sensor, interface=iface,
                              weight=self.config.scoring.weight("sensor_lost"))]
 
@@ -227,9 +231,13 @@ class Pipeline:
         self._emit([alert], None)
 
     def _maybe_expire(self, now: float) -> None:
+        # Every minute of event time, and every 10,000 events (a capture whose timestamps do
+        # not advance must not keep idle state forever).
+        self._since_expire += 1
         if self._last_expire is None:
             self._last_expire = now
-        elif now - self._last_expire >= 60.0:
+        elif now - self._last_expire >= 60.0 or self._since_expire >= 10_000:
+            self._since_expire = 0
             for det in self.detectors:
                 expire = getattr(det, "expire", None)
                 if expire:

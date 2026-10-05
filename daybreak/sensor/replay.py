@@ -34,7 +34,7 @@ class ReplayBackend(Backend):
 
     def open(self) -> None:
         if isinstance(self.source, (str, Path)):
-            self._fh = open(self.source, encoding="utf-8")
+            self._fh = open(self.source, encoding="utf-8", errors="replace")  # bad bytes: malformed lines
             self._iter = iter(self._fh)
         else:
             self._iter = iter(self.source)

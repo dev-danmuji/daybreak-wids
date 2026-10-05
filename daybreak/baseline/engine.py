@@ -29,6 +29,8 @@ from ..registry import NetworkRegistry
 
 METRICS = ("disconnects", "eapol", "connects")
 MAX_BASELINE_SPAN = 14 * 86400.0  # seconds of input used for rate statistics
+# Unregistered BSSIDs listed in a baseline (a beacon flood while learning: the rest are counted).
+MAX_CANDIDATES = 64
 METRIC_LABEL = {"disconnects": "disconnect frames", "eapol": "EAPOL frames", "connects": "(re)connections"}
 
 
@@ -70,7 +72,15 @@ class _NetAccumulator:
     bssid_security: dict[str, Counter] = field(default_factory=dict)
     profiles: dict[tuple, SecurityProfile] = field(default_factory=dict)
     bssid_obs: Counter = field(default_factory=Counter)
-    candidates: set = field(default_factory=set)
+    candidates: set = field(default_factory=set)   # at most MAX_CANDIDATES, plus the total count
+    candidate_count: int = 0
+
+    def note_candidate(self, bssid: str) -> None:
+        if bssid in self.candidates:
+            return
+        self.candidate_count += 1
+        if len(self.candidates) < MAX_CANDIDATES:
+            self.candidates.add(bssid)
     events: int = 0
 
 
@@ -94,7 +104,7 @@ class BaselineBuilder:
         acc.events += 1
         if ev.event_type in AP_OBSERVATION_TYPES:
             if ev.bssid not in net.bssids:
-                acc.candidates.add(ev.bssid)
+                acc.note_candidate(ev.bssid)
                 return
             acc.bssid_obs[ev.bssid] += 1
             if ev.channel:
@@ -129,7 +139,7 @@ class BaselineBuilder:
             return
         acc = self.nets[net.name]
         if ev.bssid not in net.bssids:
-            acc.candidates.add(ev.bssid)
+            acc.note_candidate(ev.bssid)
             return
         acc.bssid_obs[ev.bssid] += int(row.get("observations") or 1)
         if ev.channel:
@@ -190,6 +200,8 @@ class BaselineBuilder:
                 "known_channels": sorted({c for info in bssids.values() for c in info["channels"]}),
                 "security": strongest.to_dict() if strongest else None,
                 "candidate_bssids": sorted(acc.candidates),
+                **({"candidate_bssid_count": acc.candidate_count}
+                   if acc.candidate_count > len(acc.candidates) else {}),
             }
         return out
 

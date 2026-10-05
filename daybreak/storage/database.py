@@ -501,7 +501,11 @@ class Database:
             "aps": "DELETE FROM aps WHERE last_seen < ?",
         }
         with self.transaction() as conn:
-            return {table: conn.execute(sql, (older_than,)).rowcount for table, sql in statements.items()}
+            removed = {table: conn.execute(sql, (older_than,)).rowcount for table, sql in statements.items()}
+        if any(removed.values()) and self.path != ":memory:":
+            # The deleted rows' old page images stay in the -wal file until it is reset.
+            self._execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return removed
 
     def table_names(self) -> list[str]:
         return [r[0] for r in self._query(

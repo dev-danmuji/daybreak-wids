@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any, Callable, Generic, Hashable, Iterable, TypeVar
 
 T = TypeVar("T")
@@ -21,9 +21,15 @@ class SlidingWindow(Generic[T]):
 
     def add(self, ts: float, value: T = None) -> None:  # type: ignore[assignment]
         if self._items and ts < self._items[-1][0]:
-            # out-of-order input counts as arriving with the newest item (O(1); crafted
-            # replays with decreasing timestamps cannot make every insert O(n))
-            ts = self._items[-1][0]
+            if self._items[-1][0] - ts > self.window:
+                # The clock went back by more than the window (or the newest item carried a
+                # stray future timestamp): start over, so that item cannot hold every later
+                # one in the window and inflate the counts.
+                self._items.clear()
+            else:
+                # Small reordering: count it with the newest item (O(1); decreasing
+                # timestamps cannot make every insert O(n)).
+                ts = self._items[-1][0]
         self._items.append((ts, value))
 
     def expire(self, now: float) -> None:
@@ -108,20 +114,36 @@ K = TypeVar("K", bound=Hashable)
 
 
 class KeyedState(Generic[K, T]):
-    """Lazily created per-key state with idle eviction."""
+    """Lazily created per-key state with idle eviction and at most ``max_keys`` keys: the least
+    recently used key is dropped first, except keys for which ``keep`` is true (registered
+    BSSIDs), so a flood of random BSSIDs cannot grow it or push out the protected network."""
 
-    def __init__(self, factory: Callable[[], T], idle_timeout: float = 3600.0):
+    def __init__(self, factory: Callable[[], T], idle_timeout: float = 3600.0, *, max_keys: int = 4096,
+                 keep: Callable[[K], bool] | None = None):
         self.factory = factory
         self.idle_timeout = idle_timeout
+        self.max_keys = max_keys
+        self.keep = keep
         self._state: dict[K, T] = {}
-        self._seen: dict[K, float] = {}
+        self._seen: OrderedDict[K, float] = OrderedDict()
 
     def get(self, key: K, now: float) -> T:
         st = self._state.get(key)
         if st is None:
             st = self._state[key] = self.factory()
-        self._seen[key] = now
+            self._seen[key] = now
+            if len(self._state) > self.max_keys:
+                self._evict_one(key)
+        else:
+            self._seen[key] = now
+            self._seen.move_to_end(key)
         return st
+
+    def _evict_one(self, newest: K) -> None:
+        victim = next((k for k in self._seen if k != newest and not (self.keep and self.keep(k))), None)
+        if victim is not None:
+            del self._seen[victim]
+            self._state.pop(victim, None)
 
     def peek(self, key: K) -> T | None:
         return self._state.get(key)

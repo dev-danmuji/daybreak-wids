@@ -7,6 +7,7 @@ import glob
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -86,6 +87,7 @@ class MonitorRunner:
         self.protected_before: dict[str, Any] | None = None
         self.protected_changes: dict[str, list[str]] = {}
         self.next_protected = 0.0
+        self.processing_errors = 0
         self._suspended_recover: Callable[[str], bool] | None = None
 
     # -- retention ---------------------------------------------------------------
@@ -96,8 +98,12 @@ class MonitorRunner:
         if self.rt.db is None or days <= 0 or self.backend.name in OFFLINE_BACKENDS:
             return
         cutoff = now - days * 86400
-        removed = self.rt.db.prune(older_than=cutoff)
-        removed["rotated log files"] = self._prune_rotated_logs(cutoff)
+        try:
+            removed = self.rt.db.prune(older_than=cutoff)
+            removed["rotated log files"] = self._prune_rotated_logs(cutoff)
+        except (OSError, sqlite3.Error) as exc:  # retention must never stop the monitor
+            self.say(f"retention: pruning failed, will retry: {exc}")
+            return
         if any(removed.values()):
             self.say("retention: removed " + ", ".join(f"{n} {t}" for t, n in removed.items() if n)
                      + f" older than {days} days")
@@ -168,7 +174,7 @@ class MonitorRunner:
             "backend": backend, "backend_error": self.last_backend_error,
             "sensor": {"interface": self.health.interface if self.health else self.cfg.sensor.interface,
                        "online": self.sensor_online},
-            "stats": dict(p.stats), "events_by_type": dict(p.type_counts),
+            "stats": {**p.stats, "processing_errors": self.processing_errors}, "events_by_type": dict(p.type_counts),
             "alerts": dict(self.rt.alerts.stats),
             "last_event": iso_utc(p.last_event_ts) if p.last_event_ts else None,
             "threat_level": threat_level(recent),
@@ -294,6 +300,9 @@ class MonitorRunner:
                 try:
                     events = self.backend.poll(0.5)
                 except BackendUnavailable as exc:
+                    if self.backend.name in OFFLINE_BACKENDS:  # a file: re-reading it would loop forever
+                        self.say(f"{self.backend.name} input ended early: {exc}")
+                        break
                     self.backend_open = False
                     self.backend.close()
                     self.last_backend_error = str(exc)
@@ -303,7 +312,13 @@ class MonitorRunner:
                     self.next_health = 0.0  # check the sensor right away
                     continue
                 for ev in events:
-                    self.rt.pipeline.process(ev)
+                    try:
+                        self.rt.pipeline.process(ev)
+                    except Exception:  # one bad event must not stop monitoring
+                        self.processing_errors += 1
+                        if self.processing_errors <= 10 or self.processing_errors % 1000 == 0:
+                            logging.getLogger("daybreak.monitor").exception(
+                                "event processing failed (%d so far)", self.processing_errors)
                 if self.backend.finished:
                     break
                 if now >= self.next_status:

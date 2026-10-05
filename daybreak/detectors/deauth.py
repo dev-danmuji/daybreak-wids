@@ -79,6 +79,8 @@ class DeauthDetector:
 
     # -- main ----------------------------------------------------------------------
     def process(self, ev: Event, ctx: DetectionContext) -> list[Finding]:
+        if self.state.keep is None:
+            self.state.keep = lambda bssid, reg=ctx.registry: reg.by_bssid(bssid) is not None
         if not ev.is_disconnect or not ev.bssid:
             return []
         ts = ev.timestamp

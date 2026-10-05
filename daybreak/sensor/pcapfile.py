@@ -135,6 +135,7 @@ class PcapFileBackend(Backend):
         self._fh: BinaryIO | None = None
         self._iter: Iterator[tuple[float, int, bytes]] | None = None
         self._done = False
+        self.input_error: str | None = None
         self.stats.update(frames=0, unparsable=0, ignored=0, bad_timestamp=0)
 
     def open(self) -> None:
@@ -177,9 +178,10 @@ class PcapFileBackend(Backend):
                     break
             else:
                 self._done = True
-        except CaptureFormatError as exc:
+        except CaptureFormatError as exc:  # the rest of the file is unreadable: keep what was read
             self._done = True
-            raise BackendUnavailable(str(exc)) from exc
+            self.input_error = str(exc)
+            self.note_error(f"capture ends early: {exc}")
         self.stats["events"] += len(out)
         return out
 

@@ -533,7 +533,7 @@ def test_prepare_refuses_a_connected_or_unexpected_sensor(tmp_path):
     assert sensor_identity_problem(cfg, idle, require_disconnected=True) is None
     connected = NS(**{**idle.__dict__, "nm_state": "connected"})
     assert "connected" in sensor_identity_problem(cfg, connected, require_disconnected=True)
-    assert sensor_identity_problem(cfg, connected, require_disconnected=False) is None  # release is fine
+    assert sensor_identity_problem(cfg, connected, require_disconnected=False) is None  # identity only
     associated = NS(**{**idle.__dict__, "ssid": "SomeNetwork"})
     assert "associated" in sensor_identity_problem(cfg, associated, require_disconnected=True)
     internal = NS(mac="02:00:00:00:00:01", driver="iwlwifi", nm_state="disconnected", iftype="managed", ssid=None)
@@ -542,7 +542,8 @@ def test_prepare_refuses_a_connected_or_unexpected_sensor(tmp_path):
     assert "driver" in sensor_identity_problem(no_mac, internal, require_disconnected=False)
 
 
-def test_cli_prepare_refuses_a_connected_sensor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("args", [["prepare", "--apply", "--channel", "36"], ["release", "--apply"]])
+def test_cli_prepare_and_release_refuse_a_connected_sensor(tmp_path, monkeypatch, args):
     import yaml
     from click.testing import CliRunner
 
@@ -571,7 +572,7 @@ def test_cli_prepare_refuses_a_connected_sensor(tmp_path, monkeypatch):
     monkeypatch.setattr(discovery, "capability_effective", lambda *a, **kw: {"CAP_NET_ADMIN", "CAP_NET_RAW"})
     path = tmp_path / "c.yaml"
     path.write_text(yaml.safe_dump({"protected_networks": []}))
-    r = CliRunner().invoke(cli.main, ["-c", str(path), "sensor", "prepare", "--apply", "--channel", "36"])
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "sensor", *args])  # release would take it down first
     assert r.exit_code == 1 and "connected to a network" in r.output
     assert all(not rr.executed for rr in runners)
 
@@ -665,7 +666,6 @@ def test_malformed_capture_files_fail_cleanly(tmp_path):
     import struct
 
     import frames_hex as F
-    from daybreak.sensor.backend import BackendUnavailable
 
     frame = F.RT_5180 + F.DEAUTH_UNICAST
     shb = _pcapng()
@@ -679,8 +679,10 @@ def test_malformed_capture_files_fail_cleanly(tmp_path):
     }
     for name, data in cases.items():
         (tmp_path / name).write_bytes(data)
-        with pytest.raises(BackendUnavailable):
-            _read_capture(tmp_path / name)
+        backend, events = _read_capture(tmp_path / name)  # ends, never loops or raises mid-file
+        assert backend.finished and backend.input_error, name
+    backend, events = _read_capture(tmp_path / "epb_too_short")
+    assert len(events) == 1  # frames before the corrupt block are kept
     # an if_tsresol option without its value byte is ignored, not a crash
     (tmp_path / "tsresol").write_bytes(_pcapng(_idb(struct.pack("<HH", 9, 1))))
     _read_capture(tmp_path / "tsresol")
@@ -1197,3 +1199,458 @@ def test_readonly_open_never_serves_old_data_while_a_wal_is_pending(tmp_path):
     finally:
         for d in (snap, clean):
             d.chmod(0o755)
+
+
+# -- fix verification, round 4: sensor use, Kismet input, config, output ------------------------------------
+
+@pytest.mark.parametrize("iftype", ["AP", "P2P-GO", "IBSS", "mesh point"])
+def test_a_sensor_serving_or_joining_a_network_is_in_use(tmp_path, iftype):
+    from daybreak.sensor.control import sensor_identity_problem
+
+    cfg = make_config(tmp_path, sensor={"interface": ALFA, "expected_mac": ALFA_MAC}).sensor
+    hotspot = NS(mac=ALFA_MAC, driver="mt7921u", nm_state="unmanaged", iftype=iftype, ssid="MyHotspot")
+    assert f"{iftype} mode" in sensor_identity_problem(cfg, hotspot, require_disconnected=True)
+    monitor = NS(**{**hotspot.__dict__, "iftype": "monitor", "ssid": None})
+    assert sensor_identity_problem(cfg, monitor, require_disconnected=True) is None  # what release expects
+
+
+def test_read_only_commands_cannot_be_declared_interface_changing():
+    guard = NS(assert_may_modify=lambda iface: None)
+    with pytest.raises(SafetyViolation, match="not an interface-changing command"):
+        safety.checked_command(["iw", "dev", ALFA, "info"], mutating=True, guard=guard)
+
+
+def test_the_host_command_allow_list_is_pinned():
+    # Widening the runtime allow-list must show up as a test change in review: e.g. `iw dev X scan`
+    # or `iw dev X connect` would make the adapter transmit.
+    assert {e.pattern for e in safety.COMMAND_ALLOW_LIST} == {
+        ("iw", "phy", None, "info"),
+        ("iw", "dev", None, "info"),
+        ("iw", "reg", "get"),
+        ("iw", "dev", None, "set", "type", frozenset({"monitor", "managed"})),
+        ("iw", "dev", None, "set", "channel", None),
+        ("ip", "link", "set", None, frozenset({"up", "down"})),
+        ("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"),
+        ("nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"),
+        ("nmcli", "device", "set", None, "managed", frozenset({"yes", "no"})),
+    }
+
+
+def test_kismet_alert_fields_are_strings_identifiers_and_plausible_times():
+    from daybreak.sensor.kismet import alert_to_event
+
+    def rec(**over):
+        base = {"kismet.alert.header": "DEAUTHFLOOD", "kismet.alert.timestamp": 1_790_000_000.5,
+                "kismet.alert.transmitter_mac": "AA:BB:CC:DD:EE:FF", "kismet.alert.text": "flood"}
+        return {**base, **over}
+
+    nested = alert_to_event(rec(**{"kismet.alert.text": {"anonce": "ab" * 32, "mic": "cd" * 16},
+                                   "kismet.alert.class": {"x": 1}}), "s")
+    assert "kismet_text" not in nested.metadata and "kismet_class" not in nested.metadata
+    assert alert_to_event(rec(**{"kismet.alert.header": {"h": 1}}), "s") is None
+    assert alert_to_event(rec(**{"kismet.alert.header": "CRYPTODROP\x1b[31m"}), "s").metadata["kismet_header"] == "OTHER"
+    assert alert_to_event(rec(**{"kismet.alert.header": "x" * 65}), "s").metadata["kismet_header"] == "OTHER"
+    for ts in (1e13, -5.0, float("nan")):
+        assert alert_to_event(rec(**{"kismet.alert.timestamp": ts}), "s") is None
+
+
+def test_replayed_kismet_headers_cannot_inject_into_alert_types(tmp_path):
+    from daybreak.detectors.base import DetectionContext
+    from daybreak.detectors.kismet_alerts import KismetAlertDetector
+    from daybreak.models import Event
+    from daybreak.registry import NetworkRegistry
+
+    cfg = make_config(tmp_path)
+    ctx = DetectionContext(cfg, NetworkRegistry(cfg.protected_networks))
+    ev = Event.from_dict({"ts": 1_790_000_000.0, "type": "kismet_alert", "bssid": "AA:BB:CC:DD:EE:FF",
+                          "kismet_header": "CRYPTODROP\x1b[2J"})
+    assert [f.finding_type for f in KismetAlertDetector().process(ev, ctx)] == ["KISMET_OTHER"]
+
+
+def test_an_implausible_kismet_clock_does_not_wedge_alert_polling():
+    from daybreak.config import KismetConfig
+    from daybreak.sensor.kismet import KismetBackend
+
+    class Client:
+        base = "http://127.0.0.1:2501"
+
+        def system_status(self):
+            return {"kismet.system.version": "x", "kismet.system.timestamp.sec": 1e13}
+
+        def server_time(self, st):
+            return 1e13
+
+        def datasources(self):
+            return []
+
+        def auth_headers(self):
+            return {}
+
+    b = KismetBackend(KismetConfig(use_eventbus=False, frame_tap=False), sensor_interface=ALFA, client=Client(),
+                      clock=lambda: 1_790_000_000.0)
+    b.open()
+    assert b.last_alert_ts == 1_790_000_000.0
+
+
+@pytest.mark.parametrize("section, match", [
+    ({"sensor": {"protected_interfaces": []}}, "must not be empty"),
+    ({"backend": {"kismet": {"api_key_env": "4C3B9F0A1D2E3F4A5B6C7D8E9F0A1B2C"}}}, "not the secret"),
+    ({"backend": {"kismet": {"api_key_env": "ABCDEF0123456789ABCDEF0123456789"}}}, "not the secret"),
+    ({"backend": {"kismet": {"password_env": "my password"}}}, "not the secret"),
+    ({"logging": {"human_log": "/var/log/daybreak/daybreak.log"}}, "file name inside"),
+    ({"logging": {"jsonl_log": "sub/alerts.jsonl"}}, "file name inside"),
+    ({"alerts": {"notifiers": [{"type": "jsonl", "options": {"psk": "x"}}]}}, "looks like a secret"),
+])
+def test_config_rejects_unsafe_values_at_load(tmp_path, section, match):
+    with pytest.raises(ConfigError, match=match):
+        config_from_dict(section, base_dir=tmp_path)
+
+
+def test_retention_failures_do_not_stop_the_monitor(tmp_path):
+    import sqlite3
+
+    from daybreak.monitor import MonitorRunner
+
+    said = []
+    runner = MonitorRunner.__new__(MonitorRunner)
+    runner.cfg = make_config(tmp_path)
+    runner.rt = NS(db=NS(prune=lambda older_than: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error"))))
+    runner.backend = NS(name="passive")
+    runner.say = said.append
+    runner._prune(1_790_000_000.0)
+    assert said and "pruning failed" in said[0]
+
+
+def test_pruned_rows_do_not_linger_in_the_wal(tmp_path):
+    from daybreak.models import Event
+
+    db = Database(tmp_path / "w.db")
+    old = 1_790_000_000.0 - 90 * 86400
+    db.insert_events([Event.from_dict({"ts": old + i, "type": "deauth", "bssid": "AA:BB:CC:DD:EE:FF",
+                                       "src": "AA:BB:CC:DD:EE:FF", "dst": "DE:AD:BE:EF:00:01"}) for i in range(50)])
+    assert db.prune(older_than=1_790_000_000.0 - 30 * 86400)["events"] == 50
+    wal = tmp_path / "w.db-wal"
+    assert not wal.exists() or b"\xde\xad\xbe\xef" not in wal.read_bytes() and "DE:AD:BE:EF" not in wal.read_text("latin-1")
+    db.close()
+
+
+def test_invisible_and_line_separator_characters_are_escaped():
+    from daybreak.alerts.formatting import printable
+
+    for ch in (" ", " ", "​", "‍", "﻿", "⁠", "؜"):
+        assert ch not in printable(f"x{ch}second") and "\\u" in printable(f"x{ch}second")
+    assert "x second".splitlines() == ["x second"]
+    assert printable("Café ☕") == "Café ☕"
+
+
+@pytest.mark.parametrize("ssid, text, attributed", [
+    ("Bob's WiFi", "IEEE80211 Unauthorized device (02:AA:00:00:00:01) advertising for SSID 'Bob's WiFi', "
+                   "matching APSPOOF rule r", True),
+    ("home", "advertising for SSID 'home', matching APSPOOF rule", True),
+    ("home", 'advertising for SSID "home" on channel 6', True),
+    ("home", "advertising for SSID 'myhome', matching", False),
+    ("home", "advertising for SSID 'home_2G', matching", False),
+    ("home", "advertising for SSID 'a'home'b', matching", False),
+])
+def test_kismet_texts_are_attributed_by_the_whole_quoted_ssid(tmp_path, ssid, text, attributed):
+    from daybreak.models import Event
+    from daybreak.registry import NetworkRegistry
+
+    cfg = make_config(tmp_path, protected_networks=[{"name": "n", "ssid": ssid}])
+    reg = NetworkRegistry(cfg.protected_networks)
+    ev = Event.from_dict({"ts": 1_790_000_000.0, "type": "kismet_alert", "kismet_header": "APSPOOF",
+                          "kismet_text": text, "src": "02:AA:00:00:00:01"})
+    assert (reg.network_of(ev) is not None) is attributed
+
+
+def test_cli_output_escapes_relayed_kismet_text(tmp_path):
+    import json
+
+    import yaml
+    from click.testing import CliRunner
+
+    from daybreak.models import Alert, ScoreComponent
+    from daybreak.monitor import status_path
+
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"storage": {"database": str(tmp_path / "d.db")},
+                                    "logging": {"directory": str(tmp_path / "log")}}))
+    cfg = cli.load_config(str(path))
+    db = Database(cfg.database_path)
+    db.insert_alert(Alert("KISMET_X\x1b[2J", 1_790_000_000.0, 10, [ScoreComponent(10, "l", "", "kismet_other")]))
+    db.close()
+    status_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    status_path(cfg).write_text(json.dumps({"state": "running", "updated": 1_790_000_000.0, "pid": 1,
+                                            "backend": {"name": "kismet", "detail": "Kismet\x1b]0;pwned\x07"}}))
+    for args in (["alerts", "--since", "100000d"], ["monitor", "status"]):
+        out = CliRunner().invoke(cli.main, ["-c", str(path), *args]).output
+        assert "\x1b" not in out and "\x07" not in out, args
+
+
+def test_monitor_start_says_when_desktop_notifications_are_off(tmp_path, monkeypatch):
+    import yaml
+    from click.testing import CliRunner
+
+    from daybreak.alerts import desktop
+
+    monkeypatch.setattr(desktop.os, "geteuid", lambda: 0)
+    fixture = os.path.join(os.path.dirname(__file__), "fixtures", "normal.jsonl")
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"storage": {"database": str(tmp_path / "d.db")},
+                                    "logging": {"directory": str(tmp_path / "log")},
+                                    "alerts": {"notifiers": [{"type": "desktop"}]}}))
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "monitor", "start", "--replay", fixture, "--quiet"])
+    assert r.exit_code == 0 and "desktop notifications off: running as root" in r.output
+
+
+def test_monitor_start_warns_about_plain_http_credentials(tmp_path, monkeypatch):
+    from daybreak.sensor.kismet import KismetUnavailable
+
+    monkeypatch.setenv("DAYBREAK_TEST_PLAIN_KEY", "k")
+    cfg = make_config(tmp_path, backend={"type": "auto", "kismet": {"url": "http://192.0.2.10:2501",
+                                                                     "api_key_env": "DAYBREAK_TEST_PLAIN_KEY"}})
+    logged = []
+    import daybreak.sensor.kismet as kismet_mod
+
+    monkeypatch.setattr(kismet_mod.KismetClient, "system_status",
+                        lambda self: (_ for _ in ()).throw(KismetUnavailable("not reachable")))
+    fs, route = host_sysfs(tmp_path)
+    guard = InterfaceGuard(["wlo1"], sysfs_root=fs.net, route_file=route, runner=host_runner())
+    choose_backend(cfg, guard=guard, runner=host_runner(), log=logged.append)
+    assert any("unencrypted" in m for m in logged)
+
+
+# -- fix verification, round 5: robustness of parsing and long runs ----------------------------------------
+
+def _deauth_dict(ts, bssid="AA:BB:CC:DD:EE:FF", dst="10:22:33:44:55:01"):
+    return {"ts": ts, "type": "deauth", "bssid": bssid, "src": bssid, "dst": dst, "reason": 7, "channel": 36}
+
+
+def _deauth(ts, bssid="AA:BB:CC:DD:EE:FF", dst="10:22:33:44:55:01"):
+    from daybreak.models import Event
+
+    return Event.from_dict(_deauth_dict(ts, bssid, dst))
+
+
+def test_one_future_timestamp_cannot_hold_the_window_open(tmp_path):
+    from daybreak.detectors.window import SlidingWindow
+    from daybreak.runtime import build_runtime
+
+    w = SlidingWindow(5.0)
+    w.add(1000.0 + 3600)  # a stray frame one hour ahead
+    for t in range(10):
+        w.add(1000.0 + t * 30)
+    assert w.count(1000.0 + 9 * 30) == 1
+    # the verifier's case: benign disconnects 30 s apart after one future-stamped frame
+    rt = build_runtime(make_config(tmp_path), dry_run=True)
+    t0 = 1_790_000_000.0
+    rt.pipeline.process(_deauth(t0 + 3600))
+    for i in range(40):
+        rt.pipeline.process(_deauth(t0 + i * 30, dst=f"10:22:33:44:55:{i:02X}"))
+    assert not [a for a in rt.alerts.delivered if a.alert_type in ("DEAUTH_BURST", "MULTI_CLIENT_DEAUTH",
+                                                                   "POSSIBLE_DEAUTH_ATTACK")]
+    rt.close()
+
+
+def test_keyed_state_is_capped_and_keeps_registered_keys():
+    from daybreak.detectors.window import KeyedState
+
+    ks = KeyedState(dict, max_keys=100, keep=lambda k: k == "home")
+    ks.get("home", 0.0)
+    for i in range(10_000):
+        ks.get(f"rnd{i}", 1.0)
+    assert len(ks) == 100 and "home" in ks and f"rnd{9_999}" in ks
+
+
+def test_random_bssid_flood_cannot_evict_the_protected_bssid_or_grow_state(tmp_path):
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path), dry_run=True)
+    p = rt.pipeline
+    t0 = 1_790_000_000.0
+    for i in range(6):  # half a burst against the protected AP ...
+        p.process(_deauth(t0 + i * 0.1, dst=f"10:22:33:44:55:{i:02X}"))
+    for i in range(30_000):  # ... then a flood from random BSSIDs, all with the same timestamp ...
+        p.process(_deauth(t0 + 0.6, bssid=f"02:40:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}:01",
+                          dst="AA:BB:CC:DD:EE:FF"))
+    deauth = next(d for d in p.detectors if d.name == "deauth")
+    assert len(deauth.state) <= deauth.state.max_keys
+    assert len(p.correlator.incidents) <= 4096
+    for i in range(6):  # ... and the rest of the burst: the protected AP's window survived the flood
+        p.process(_deauth(t0 + 0.7 + i * 0.1, dst=f"10:22:33:44:55:{i + 6:02X}"))
+    assert any(a.alert_type == "DEAUTH_BURST" and a.network == "home" for a in rt.alerts.delivered)
+    rt.close()
+
+
+def test_alert_rows_for_random_bssids_are_bounded_but_protected_alerts_are_not(tmp_path):
+    from daybreak.alerts.manager import NEW_UNPROTECTED_SCOPES_PER_MINUTE, AlertManager
+    from daybreak.models import Alert, ScoreComponent
+
+    db = Database(tmp_path / "a.db")
+    manager = AlertManager([], db=db)
+    t0 = 1_790_000_000.0
+    for i in range(5000):
+        manager.submit(Alert("DEAUTH_BURST", t0 + i * 0.01, 30, [ScoreComponent(30, "burst", "")],
+                             bssid=f"02:00:00:00:{i >> 8 & 255:02X}:{i & 255:02X}"))
+    stored = db.conn.execute("SELECT COUNT(*) FROM alerts").fetchone()[0]
+    allowed = NEW_UNPROTECTED_SCOPES_PER_MINUTE * (1 + 50 / 60)  # burst plus refill over the 50 s flood
+    assert stored <= allowed + 1 and manager.stats["flood_suppressed"] == 5000 - stored
+    assert manager.submit(Alert("DEAUTH_BURST", t0 + 60, 30, [ScoreComponent(30, "burst", "")],
+                                bssid="AA:BB:CC:DD:EE:FF", network="home"))
+    db.close()
+
+
+def test_alert_and_sensor_status_write_failures_do_not_stop_detection(tmp_path):
+    import io
+    import sqlite3
+
+    from daybreak.alerts.console import ConsoleNotifier
+    from daybreak.alerts.manager import AlertManager
+    from daybreak.models import Alert, Event, ScoreComponent
+    from daybreak.runtime import build_runtime
+
+    def fail(*a, **kw):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    out = io.StringIO()
+    manager = AlertManager([ConsoleNotifier("LOW", stream=out, color=False)], db=NS(insert_alert=fail))
+    assert manager.submit(Alert("DEAUTH_BURST", 1_790_000_000.0, 50, [ScoreComponent(50, "burst", "")],
+                                network="home", bssid="AA:BB:CC:DD:EE:FF"))
+    assert "DEAUTH_BURST" in out.getvalue() and manager.stats["storage_errors"] == 1
+    rt = build_runtime(make_config(tmp_path))
+    rt.db.record_sensor_status = fail
+    rt.pipeline.process(Event.from_dict({"ts": 1_790_000_000.0, "type": "sensor", "status": "lost"}))
+    assert rt.pipeline.stats["storage_errors"] == 1
+    rt.close()
+
+
+def test_the_monitor_survives_an_event_that_fails_to_process(tmp_path):
+    import json
+
+    from daybreak.monitor import MonitorRunner
+    from daybreak.runtime import build_runtime
+    from daybreak.sensor.replay import ReplayBackend
+
+    rt = build_runtime(make_config(tmp_path), dry_run=True)
+    real = rt.pipeline.process
+    calls = []
+
+    def flaky(ev):
+        calls.append(ev)
+        if len(calls) == 1:
+            raise RuntimeError("bug in a detector")
+        return real(ev)
+
+    rt.pipeline.process = flaky
+    lines = [json.dumps(_deauth_dict(1_790_000_000.0 + i)) for i in range(3)]
+    runner = MonitorRunner(rt, ReplayBackend(lines), write_status=False, on_message=lambda m: None)
+    summary = runner.run()
+    assert len(calls) == 3 and summary["stats"]["processing_errors"] == 1
+    rt.close()
+
+
+def test_a_corrupt_capture_ends_the_run_instead_of_looping(tmp_path):
+    import struct
+
+    import yaml
+    from click.testing import CliRunner
+
+    import frames_hex as F
+
+    good = _pcapng(_idb(), _epb(F.RT_5180 + F.DEAUTH_UNICAST, 1_790_000_000_000_000))
+    (tmp_path / "cut.pcapng").write_bytes(good + struct.pack("<III", 6, 12, 12))
+    (tmp_path / "junk.pcap").write_bytes(b"this is not a capture file at all")
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"storage": {"database": str(tmp_path / "d.db")},
+                                    "logging": {"directory": str(tmp_path / "log")}, "detection": {"scope": "all"}}))
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "--dry-run", "monitor", "start", "--pcap",
+                                      str(tmp_path / "cut.pcapng"), "--quiet", "--duration", "20"])
+    assert r.exit_code == 0 and "input ended early" in r.output and "processed 1 events" in r.output
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "--dry-run", "monitor", "start", "--pcap",
+                                      str(tmp_path / "junk.pcap"), "--quiet", "--duration", "20"])
+    assert r.exit_code == 1 and "not a pcap/pcapng file" in r.output
+
+
+def test_replay_files_with_undecodable_bytes_are_read_as_malformed_lines(tmp_path):
+    from daybreak.sensor.replay import ReplayBackend
+
+    import json
+
+    good = json.dumps(_deauth_dict(1_790_000_000.0))
+    f = tmp_path / "r.jsonl"
+    f.write_bytes(good.encode() + b"\n\xff\xfe{\"ts\": 1}\n" + good.encode() + b"\n")
+    b = ReplayBackend(f)
+    b.open()
+    events = []
+    while not b.finished:
+        events += b.poll(0)
+    b.close()
+    assert len(events) == 2 and b.stats["malformed"] == 1
+
+
+def test_kismet_numeric_fields_are_range_checked():
+    from daybreak.sensor.kismet import DatasourceInfo, alert_to_event, device_to_event
+
+    alert = {"kismet.alert.header": "DEAUTHFLOOD", "kismet.alert.timestamp": 1_790_000_000.0,
+             "kismet.alert.frequency": float("inf")}
+    assert "frequency" not in alert_to_event(alert, "s").metadata
+    for packets in (float("inf"), "n/a", None):
+        DatasourceInfo.from_record({"kismet.datasource.name": "x", "kismet.datasource.num_packets": packets})
+    dev = device_to_event({"mac": "AA:BB:CC:DD:EE:FF", "ssid": "x\ud800", "type": "Wi-Fi AP", "crypt_string": "WPA2",
+                           "last_time": float("nan"), "frequency": 1e300}, "s", 1_790_000_000.0)
+    assert dev.timestamp == 1_790_000_000.0 and dev.ssid == "x?" and "frequency" not in dev.metadata
+
+
+def test_security_strings_are_cleaned_and_bounded(tmp_path, monkeypatch):
+    from daybreak.models import Event
+
+    ev = Event.from_dict({"ts": 1_790_000_000.0, "type": "beacon", "bssid": "AA:BB:CC:DD:EE:FF", "ssid": "x",
+                          "security": {"akms": ["\ud800PSK"] * 100, "group_cipher": "C" * 500, "source": "\udfff"}})
+    sec = ev.security
+    assert sec.akms[0] == "?PSK" and len(sec.akms) == 32 and len(sec.group_cipher) == 64 and sec.source == "?"
+    echoed = []
+    monkeypatch.setattr(cli.click, "echo", lambda text, **kw: echoed.append(text))
+    cli.emit_json({"text": "\ud800"})
+    echoed[0].encode("utf-8")  # --json output is always encodable (no UnicodeEncodeError on a terminal)
+
+
+def test_baseline_candidates_are_bounded(tmp_path):
+    from daybreak.baseline.engine import MAX_CANDIDATES, build_from_events
+    from daybreak.models import Event, EventType
+
+    cfg = make_config(tmp_path)
+    t0 = 1_790_000_000.0
+    events = [Event(t0 + i * 0.01, EventType.BEACON, ssid="ExampleSSID", channel=36,
+                    bssid=f"02:50:00:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}") for i in range(5000)]
+    home = build_from_events(cfg, events)["home"]
+    assert len(home["candidate_bssids"]) == MAX_CANDIDATES and home["candidate_bssid_count"] == 5000
+
+
+@pytest.mark.parametrize("section", [
+    {"detection": {"deauth": {"burst_window": float("nan")}}},
+    {"detection": {"correlation": {"window": float("inf")}}},
+    {"detection": {"baseline": {"bucket": 1e-9}}},
+    {"alerts": {"cooldown": float("nan")}},
+])
+def test_detection_timing_must_be_finite_and_sane(tmp_path, section):
+    with pytest.raises(ConfigError):
+        config_from_dict(section, base_dir=tmp_path)
+
+
+def test_monitor_status_escapes_the_interface_name(tmp_path):
+    import json
+
+    import yaml
+    from click.testing import CliRunner
+
+    from daybreak.monitor import status_path
+
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"storage": {"database": str(tmp_path / "d.db")},
+                                    "logging": {"directory": str(tmp_path / "log")}}))
+    cfg = cli.load_config(str(path))
+    status_path(cfg).parent.mkdir(parents=True, exist_ok=True)
+    status_path(cfg).write_text(json.dumps({"state": "running", "updated": 1_790_000_000.0, "pid": 1,
+                                            "sensor": {"interface": "wlx\x1b]0;pwned\x07", "online": False}}))
+    out = CliRunner().invoke(cli.main, ["-c", str(path), "monitor", "status"]).output
+    assert "\x1b" not in out and "\x07" not in out
