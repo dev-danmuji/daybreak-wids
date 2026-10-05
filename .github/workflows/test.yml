@@ -1,0 +1,56 @@
+name: tests
+
+# Synthetic tests only: no Wi-Fi hardware, no root, no RF access.
+# During the run tests/conftest.py also refuses AF_PACKET sockets and
+# subprocess.run calls to iw/ip/nmcli/notify-send and other network tools.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Refuse to run privileged
+        run: test "$(id -u)" -ne 0
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev,dashboard,eventbus]'
+
+      - name: Byte-compile
+        run: python -m compileall -q daybreak
+
+      - name: Tests
+        run: python -m pytest
+
+      - name: Synthetic demo (dry-run replay, no hardware)
+        run: |
+          daybreak-wids -c config.example.yaml --dry-run monitor start \
+            --replay tests/fixtures/handshake_pattern.jsonl > demo.txt
+          cat demo.txt
+          grep -q "CRITICAL POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT" demo.txt

@@ -1,3 +1,5 @@
-# Verbatim captures of iw/nmcli output (anonymised). iw emits trailing spaces;
+# Verbatim captures of iw/nmcli output: the internet interface's MAC/SSID and host
+# specific device names are anonymised; the sensor adapter (wlx00c0cab85c32) is the
+# documented example and kept. iw emits trailing spaces;
 # keep them so the parsers are tested against real output.
 tests/fixtures/host/*.txt -whitespace
