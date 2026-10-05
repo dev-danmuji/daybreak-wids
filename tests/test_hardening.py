@@ -271,9 +271,18 @@ def test_files_are_handed_back_to_the_sudo_user_without_following_symlinks(tmp_p
                         lambda fd, u, g: chowned.append((os.readlink(f"/proc/self/fd/{fd}"), u, g)))
     (tmp_path / "f").write_text("x")
     (tmp_path / "link").symlink_to(tmp_path / "f")
+    monkeypatch.setattr(fileperm, "_parent_owner", lambda path: 4242)  # a directory of the sudo user
     fileperm.secure_path(tmp_path / "f")
     fileperm.secure_path(tmp_path / "link")   # O_NOFOLLOW: the link is not followed
     assert chowned == [(str(tmp_path / "f"), 4242, 4343)]
+    chowned.clear()
+    monkeypatch.setattr(fileperm, "_parent_owner", lambda path: 0)     # e.g. a file a config put into /etc
+    fileperm.secure_path(tmp_path / "f")
+    assert chowned == []
+    monkeypatch.setattr(fileperm, "_parent_owner", lambda path: 4242)
+    os.link(tmp_path / "f", tmp_path / "hard")                          # a hard link to another file
+    fileperm.secure_path(tmp_path / "hard")
+    assert chowned == []
     monkeypatch.setenv("SUDO_UID", "0")
     assert fileperm.invoking_user() is None
 
@@ -819,3 +828,162 @@ def test_low_severity_flood_cannot_starve_a_high_alert_on_the_console():
     manager.submit(Alert("POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT", 1_790_000_006.0, 95,
                          [ScoreComponent(95, "pattern", "")], bssid="AA:BB:CC:DD:EE:FF", summary="real"))
     assert "CRITICAL POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT" in out.getvalue()
+
+
+# -- second review round: fix verification follow-ups ---------------------------------------------------------
+
+def test_interface_names_follow_kernel_rules():
+    from daybreak.safety import valid_ifname
+
+    for good in ("wlo1", "wlx00c0cab85c32", "wl#guest", "wlan0.100", "mon@phy0", "149"):
+        assert valid_ifname(good), good
+    for bad in ("", ".", "..", "-h", "a/b", "a:b", "a b", "tab\tx", "nul\x00", "a" * 16, None, 7):
+        assert not valid_ifname(bad), bad
+
+
+def test_protected_snapshot_runs_nmcli_once(tmp_path):
+    fs, route = host_sysfs(tmp_path)
+    fs.add_wireless("wlo2", phy="phy0", mac="02:00:00:00:00:02", driver="iwlwifi")  # PHY sibling of wlo1
+    runner = host_runner()
+    guard = InterfaceGuard(["wlo1"], sysfs_root=fs.net, route_file=route, runner=runner)
+    snaps = guard.snapshot_protected()
+    assert set(snaps) == {"wlo1", "wlo2"}
+    assert sum(1 for argv in runner.history if argv[0] == "nmcli") == 1
+
+
+def test_snapshot_compare_includes_the_phy():
+    before = InterfaceSnapshot("wlo1", True, phy="phy0")
+    after = InterfaceSnapshot("wlo1", True, phy="phy7")
+    assert before.compare(after) == ["phy: 'phy0' -> 'phy7'"]
+
+
+def test_release_warns_but_prepare_refuses_when_a_protected_interface_is_missing(tmp_path, monkeypatch):
+    import yaml
+    from click.testing import CliRunner
+
+    import daybreak.sensor.discovery as discovery
+
+    fs, route = host_sysfs(tmp_path)
+    runners = []
+
+    def runner_factory(dry_run=False, timeout=10.0):
+        r = host_runner(dry_run=dry_run)
+        runners.append(r)
+        return r
+
+    original = discovery.Discovery
+
+    class FakeDiscovery(original):
+        def __init__(self, runner=None, **kw):
+            super().__init__(runner, sysfs_root=fs.net, route_file=route)
+
+    monkeypatch.setattr(cli, "CommandRunner", runner_factory)
+    monkeypatch.setattr(cli, "InterfaceGuard", lambda *a, **kw: InterfaceGuard(*a, sysfs_root=fs.net,
+                                                                               route_file=route, **kw))
+    monkeypatch.setattr(discovery, "Discovery", FakeDiscovery)
+    monkeypatch.setattr(discovery, "capability_effective", lambda *a, **kw: {"CAP_NET_ADMIN", "CAP_NET_RAW"})
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"sensor": {"protected_interfaces": ["wlo1", "wlo9"]}}))
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "sensor", "release", "--apply"])
+    assert r.exit_code == 0 and "warning: protected interface(s) wlo9 not found" in r.output
+    assert any(rr.executed for rr in runners)                      # the sensor was handed back
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "sensor", "prepare", "--apply"])
+    assert r.exit_code == 1 and "wlo9 not found" in r.output
+
+
+def test_recovery_needs_all_protected_interfaces_and_a_full_identity(tmp_path):
+    fs, route = host_sysfs(tmp_path)
+    guard = InterfaceGuard(["wlo1", "wlo9"], sysfs_root=fs.net, route_file=route, runner=host_runner())
+    cfg = make_config(tmp_path, sensor={"interface": ALFA, "expected_mac": ALFA_MAC})
+    idle = NS(mac=ALFA_MAC.lower(), driver="mt7921u", nm_state="disconnected", iftype="managed", ssid=None)
+    assert "wlo9" in cli.SensorRecovery(cfg, guard, runner=None).problem(ALFA, idle)
+    no_driver = make_config(tmp_path, sensor={"interface": ALFA, "expected_mac": ALFA_MAC, "expected_driver": None})
+    assert "expected_driver" in cli.SensorRecovery(no_driver, None, None).problem("wlan5", idle)
+    assert cli.SensorRecovery(no_driver, None, None).problem(ALFA, idle) is None  # same name: fine
+
+
+def test_recovery_changes_are_alerted_and_auto_prepare_resumes_after_restoration(tmp_path):
+    from test_monitor import T0, FakeBackend, FakeClock, runtime
+
+    from daybreak.monitor import MonitorRunner
+
+    rt = runtime(tmp_path)
+
+    class Guard:
+        state = "connected"
+
+        def snapshot_protected(self):
+            return {"wlo1": InterfaceSnapshot("wlo1", True, operstate="up", nm_state=self.state)}
+
+        verify_unchanged = staticmethod(InterfaceGuard.verify_unchanged)
+
+    guard = Guard()
+    clock = FakeClock(start=T0, step=1.0)
+    clock.at(12, lambda: setattr(guard, "state", "connecting"))
+    clock.at(25, lambda: setattr(guard, "state", "connected"))
+    runner = MonitorRunner(rt, FakeBackend([]), duration=40, clock=clock, sleep=lambda s: None,
+                           guard=guard, recover=lambda iface: True)
+    runner.run()
+    statuses = [r["status"] for r in rt.db.latest_sensor_status(limit=10)]
+    assert "PROTECTED_CHANGED" in statuses and "PROTECTED_RESTORED" in statuses
+    assert runner.recover is not None                 # resumed once wlo1 was back to its state at start
+
+    class Recovery:
+        last_protected_changes = {"wlo1": ["nm_state: 'connected' -> 'disconnected'"]}
+
+        def __call__(self, iface):
+            return False
+
+    from daybreak.sensor.status import HealthTransition
+
+    rt2 = runtime(tmp_path / "second")
+    runner2 = MonitorRunner(rt2, FakeBackend([]), duration=1, clock=FakeClock(start=T0), sleep=lambda s: None,
+                            recover=Recovery())
+    runner2._transition(HealthTransition("SENSOR_RECOVERED", T0, ALFA, ALFA_MAC))
+    assert rt2.db.list_alerts(alert_type="PROTECTED_INTERFACE_CHANGED")
+    rt.close()
+    rt2.close()
+
+
+@pytest.mark.parametrize("status", [404, 500])
+def test_any_http_answer_at_the_kismet_url_prevents_the_fallback(tmp_path, status):
+    import http.server
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True).start()
+    try:
+        cfg = make_config(tmp_path, backend={"type": "auto", "kismet": {
+            "url": f"http://127.0.0.1:{server.server_address[1]}", "timeout": 2}})
+        fs, route = host_sysfs(tmp_path)
+        runner = host_runner()
+        guard = InterfaceGuard(["wlo1"], sysfs_root=fs.net, route_file=route, runner=runner)
+        with pytest.raises(ValueError, match="will not fall back"):
+            choose_backend(cfg, guard=guard, runner=runner, log=lambda m: None)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.parametrize("section", [{"sensor": {"dwell_time": 0.01}}, {"sensor": {"health_check_interval": 0.2}},
+                                     {"sensor": {"dwell_time": float("inf")}}])
+def test_sensor_intervals_have_minimums(tmp_path, section):
+    with pytest.raises(ConfigError, match="at least"):
+        config_from_dict(section, base_dir=tmp_path)
+
+
+def test_smoke_script_backgrounds_sudo_itself():
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "hardware-smoke-test.sh").read_text()
+    assert 'sudo "$DAYBREAK" -c "$CONFIG" monitor start --backend passive' in script
+    assert "sdb monitor start" not in script  # a backgrounded shell function would ignore SIGINT

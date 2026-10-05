@@ -10,7 +10,7 @@ from ..config import Config
 from ..safety import CommandRunner, InterfaceGuard, valid_ifname
 from .backend import Backend, BackendUnavailable
 from .control import SensorController
-from .kismet import KismetAuthError, KismetBackend, KismetClient, KismetError
+from .kismet import KismetBackend, KismetClient, KismetError, KismetUnavailable
 from .passive import PassiveBackend
 from .pcapfile import PcapFileBackend
 from .replay import ReplayBackend
@@ -64,16 +64,16 @@ def choose_backend(config: Config, kind: str | None = None, *, replay: str | Pat
         reachable = True
         try:
             client.system_status()
-        except KismetAuthError as exc:
-            # Kismet is running and owns the sensor: falling back to the passive backend would
-            # retune the adapter Kismet is driving.
-            raise ValueError(f"{exc}. Kismet is running at {client.base}, so daybreak-wids will not fall "
-                             "back to the passive backend; fix the API key, or stop Kismet and use "
-                             "--backend passive") from exc
-        except KismetError as exc:
+        except KismetUnavailable as exc:  # nothing answers: no Kismet here
             reachable = False
             if kind == "auto":
                 log(f"Kismet unavailable ({exc}); using the built-in passive backend")
+        except KismetError as exc:
+            # Something answers at the Kismet URL (Kismet, or a proxy in front of it): falling back
+            # to the passive backend could retune an adapter that Kismet is driving.
+            raise ValueError(f"{exc}. Something answers at {client.base}, so daybreak-wids will not fall "
+                             "back to the passive backend; fix the Kismet URL or API key, or stop Kismet "
+                             "and use --backend passive") from exc
         if reachable or kind == "kismet":
             def tap(iface: str) -> Backend:
                 # The name comes from Kismet's datasource list: receive-only, but still never a

@@ -86,6 +86,7 @@ class MonitorRunner:
         self.protected_before: dict[str, Any] | None = None
         self.protected_changes: dict[str, list[str]] = {}
         self.next_protected = 0.0
+        self._suspended_recover: Callable[[str], bool] | None = None
 
     # -- retention ---------------------------------------------------------------
     def _prune(self, now: float) -> None:
@@ -127,12 +128,18 @@ class MonitorRunner:
         if not changes:
             self.say("protected interfaces are back to their state at start")
             self._record("PROTECTED_RESTORED", {})
+            if self._suspended_recover is not None:  # re-preparing the sensor is safe again
+                self.recover, self._suspended_recover = self._suspended_recover, None
+                self.say("auto_prepare re-enabled")
             return
+        self._protected_alert(now, changes)
+
+    def _protected_alert(self, now: float, changes: dict[str, list[str]]) -> None:
         detail = "; ".join(f"{name}: {', '.join(diff)}" for name, diff in sorted(changes.items()))
-        if self.recover is not None:
-            self.recover = None  # no further sensor re-preparation in this run
+        if self.recover is not None:  # no sensor re-preparation while a protected interface differs
+            self._suspended_recover, self.recover = self.recover, None
         self.say(f"PROTECTED_INTERFACE_CHANGED {detail} (daybreak-wids sends no commands to protected "
-                 "interfaces); auto_prepare disabled for this run")
+                 "interfaces); auto_prepare suspended until it is back to its state at start")
         self._record("PROTECTED_CHANGED", {"changes": changes})
         self.rt.pipeline.emit_external(protected_alert(
             now, changes, sensor=self.cfg.sensor.interface,
@@ -193,8 +200,13 @@ class MonitorRunner:
                 self.backend.set_interface(t.interface)
             if self.backend.name == "passive":
                 if self.recover is not None:
-                    ok = self.recover(t.interface)
+                    recover = self.recover
+                    ok = recover(t.interface)
                     details["monitor_mode_restored"] = ok
+                    changed = getattr(recover, "last_protected_changes", None)
+                    if changed:  # seen by the recovery's own before/after check
+                        recover.last_protected_changes = None
+                        self._protected_alert(t.timestamp, changed)
                 self.backend_open = False
                 self.next_open = 0.0
         alert = sensor_alert(t.status, t.timestamp, sensor=self.cfg.sensor.interface, interface=t.interface,

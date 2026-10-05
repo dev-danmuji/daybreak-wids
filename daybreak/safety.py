@@ -15,7 +15,6 @@ before and verified after every sensor operation.
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 from collections import deque
@@ -54,13 +53,16 @@ def enforce_passive(safety: Any) -> None:
 # Command execution (all sensor changes go through here)
 # ---------------------------------------------------------------------------
 
-# Linux interface names: 1-15 bytes, no '/', ':' or whitespace. A leading '-' (option
-# injection) and '.'/'..' are refused as well.
-_IFNAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+-]{0,14}")
-
-
 def valid_ifname(name: Any) -> bool:
-    return isinstance(name, str) and name not in (".", "..") and _IFNAME.fullmatch(name) is not None
+    """Linux interface-name rules (1-15 bytes, no '/', ':' or whitespace, not '.' or '..'),
+    plus: printable, and no leading '-' (it would read as an option)."""
+    if not isinstance(name, str) or name in ("", ".", "..") or name.startswith("-"):
+        return False
+    try:
+        size = len(name.encode("utf-8"))
+    except UnicodeEncodeError:
+        return False
+    return size <= 15 and name.isprintable() and not any(c in "/:" or c.isspace() for c in name)
 
 
 class AllowedCommand(NamedTuple):
@@ -85,6 +87,8 @@ COMMAND_ALLOW_LIST: tuple[AllowedCommand, ...] = (
 
 # Tools are resolved here only, never through the caller's PATH (sudo -E, an activated venv).
 TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+# Read-only snapshots run inside the monitor loop: keep a hung NetworkManager from stalling capture.
+SNAPSHOT_TIMEOUT = 3.0
 
 
 def match_command(argv: Sequence[str]) -> AllowedCommand | None:
@@ -156,7 +160,7 @@ class CommandRunner:
         self.history: deque[list[str]] = deque(maxlen=200)  # recent commands, bounded
 
     def run(self, argv: Sequence[str], *, mutating: bool = False,
-            guard: "InterfaceGuard | None" = None) -> CommandResult:
+            guard: "InterfaceGuard | None" = None, timeout: float | None = None) -> CommandResult:
         argv = list(argv)
         mutating = checked_command(argv, mutating, guard)
         self.history.append(argv)
@@ -168,8 +172,8 @@ class CommandRunner:
         # Minimal environment: children never see API keys or the caller's PATH.
         env = {"PATH": TRUSTED_PATH, "LC_ALL": "C", "LANG": "C"}
         try:
-            proc = subprocess.run([exe, *argv[1:]], capture_output=True, text=True, timeout=self.timeout,
-                                  env=env, check=False)
+            proc = subprocess.run([exe, *argv[1:]], capture_output=True, text=True,
+                                  timeout=self.timeout if timeout is None else timeout, env=env, check=False)
         except FileNotFoundError:
             return CommandResult(argv, 127, "", f"{argv[0]}: command not found")
         except subprocess.TimeoutExpired:
@@ -222,7 +226,7 @@ class InterfaceSnapshot:
     def compare(self, after: "InterfaceSnapshot") -> list[str]:
         """Return human-readable differences (empty list == unchanged)."""
         diffs = []
-        for name in ("exists", "operstate", "mac", "iftype", "ssid", "nm_state"):
+        for name in ("exists", "operstate", "mac", "phy", "iftype", "ssid", "nm_state"):
             before_v, after_v = getattr(self, name), getattr(after, name)
             if before_v != after_v:
                 diffs.append(f"{name}: {before_v!r} -> {after_v!r}")
@@ -320,19 +324,22 @@ class InterfaceGuard:
             raise SafetyViolation(f"refusing to modify {iface}: not a wireless interface")
 
     # -- snapshots -----------------------------------------------------------
-    def _nm_state(self, iface: str) -> str | None:
-        if self._nm_state_lookup is not None:
-            return self._nm_state_lookup(iface)
-        res = self.runner.run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"])
+    def _nm_states(self) -> dict[str, str]:
+        res = self.runner.run(["nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"], timeout=SNAPSHOT_TIMEOUT)
         if not res.ok:
-            return None
+            return {}
+        out = {}
         for line in res.stdout.splitlines():
             dev, _, state = line.partition(":")
-            if dev == iface:
-                return state
-        return None
+            out[dev] = state
+        return out
 
-    def snapshot(self, iface: str) -> InterfaceSnapshot:
+    def _nm_state(self, iface: str, states: Mapping[str, str] | None = None) -> str | None:
+        if self._nm_state_lookup is not None:
+            return self._nm_state_lookup(iface)
+        return (self._nm_states() if states is None else states).get(iface)
+
+    def snapshot(self, iface: str, *, nm_states: Mapping[str, str] | None = None) -> InterfaceSnapshot:
         exists = (self.sysfs_root / iface).exists()
         snap = InterfaceSnapshot(name=iface, exists=exists)
         if not exists:
@@ -340,7 +347,7 @@ class InterfaceGuard:
         snap.operstate = self._read(iface, "operstate")
         snap.mac = (self._read(iface, "address") or "").upper() or None
         snap.phy = self.phy_of(iface)
-        res = self.runner.run(["iw", "dev", iface, "info"])
+        res = self.runner.run(["iw", "dev", iface, "info"], timeout=SNAPSHOT_TIMEOUT)
         if res.ok:
             for line in res.stdout.splitlines():
                 line = line.strip()
@@ -350,11 +357,12 @@ class InterfaceGuard:
                     snap.ssid = line.split(None, 1)[1]
                 elif line.startswith("channel "):
                     snap.channel = line.split(None, 1)[1]
-        snap.nm_state = self._nm_state(iface)
+        snap.nm_state = self._nm_state(iface, nm_states)
         return snap
 
     def snapshot_protected(self) -> dict[str, InterfaceSnapshot]:
-        return {name: self.snapshot(name) for name in sorted(self.protected_set())}
+        states = None if self._nm_state_lookup is not None else self._nm_states()  # one nmcli call
+        return {name: self.snapshot(name, nm_states=states) for name in sorted(self.protected_set())}
 
     @staticmethod
     def verify_unchanged(before: Mapping[str, InterfaceSnapshot],

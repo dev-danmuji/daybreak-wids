@@ -169,7 +169,11 @@ if [ "$MODE" = run ]; then
 fi
 echo "   live output: tail -f $OUT/monitor.txt"
 START=$(date +%s)
-sdb monitor start --backend passive --duration "$SECONDS_TO_RUN" > "$OUT/monitor.txt" 2>&1 &
+# sudo itself must be the background job: sudo relays SIGINT to the monitor, whereas a
+# backgrounded shell function would be a subshell that ignores SIGINT. The redirect runs as you
+# (intended: the record file is yours, owner-only).
+# shellcheck disable=SC2024
+sudo "$DAYBREAK" -c "$CONFIG" monitor start --backend passive --duration "$SECONDS_TO_RUN" > "$OUT/monitor.txt" 2>&1 &
 MON_PID=$!
 ( while sleep 5; do
     sudo -n -v 2>/dev/null || true   # keep the sudo timestamp alive so the watcher can always stop the monitor

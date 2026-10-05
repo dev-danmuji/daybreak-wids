@@ -279,6 +279,8 @@ SCRIPTS = sorted((PKG.parent / "scripts").glob("*.sh"))
 _SUDO_AT_COMMAND = re.compile(r"(?:^|[;&|({]|\$\(|\b(?:then|do|else)\b)\s*sudo\b((?:\$\([^)]*\)|[^;&|)])*)")
 _ALLOWED_SUDO = [
     re.compile(r'^\s*"\$DAYBREAK" -c "\$CONFIG" "\$@"\s*$'),          # daybreak-wids itself (guarded)
+    re.compile(r'^\s*"\$DAYBREAK" -c "\$CONFIG" monitor start --backend passive --duration "\$SECONDS_TO_RUN"'
+               r'( > "\$OUT/monitor\.txt" 2>)?\s*$'),                       # the time-limited monitor
     re.compile(r'^\s*(-n )?kill -INT "\$MON_PID"( 2>/dev/null)?\s*$'),  # stop its own monitor
     re.compile(r'^\s*chown -R -h "\$\(id -u\):\$\(id -g\)" var( 2>/dev/null)?\s*$'),  # hand back var/
     re.compile(r"^\s*-n -v( 2>/dev/null)?\s*$"),                        # keep the timestamp alive

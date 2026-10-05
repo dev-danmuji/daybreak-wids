@@ -43,7 +43,7 @@ def secure_path(path: str | Path) -> None:
     except OSError:  # missing, a symlink (ELOOP), or not ours to open
         return
     try:
-        secure_fd(fd)
+        secure_fd(fd, path)
     except OSError:
         pass
     finally:
@@ -64,14 +64,29 @@ def private_dir(path: str | Path) -> Path:
     return p
 
 
-def secure_fd(fd: int) -> None:
-    """Owner-only permissions (``0600``, directories ``0700``) and, under sudo, the invoking
-    user as owner, applied to an open descriptor (no path, so no symlink race)."""
+def _parent_owner(path: str | Path | None) -> int | None:
+    if path is None:
+        return None
+    try:
+        return os.stat(Path(path).parent).st_uid
+    except OSError:
+        return None
+
+
+def secure_fd(fd: int, path: str | Path | None = None) -> None:
+    """Owner-only permissions (``0600``, directories ``0700``) applied to an open descriptor.
+
+    Under sudo the invoking user becomes the owner, but only inside a directory that user owns
+    (e.g. the repository's ``var/``): files a config points into system directories stay root's.
+    A regular file with more than one hard link is never changed.
+    """
     st = os.fstat(fd)
+    if stat.S_ISREG(st.st_mode) and st.st_nlink != 1:
+        return
     if st.st_mode & 0o077 and (st.st_uid == os.geteuid() or os.geteuid() == 0):
         os.fchmod(fd, 0o700 if stat.S_ISDIR(st.st_mode) else 0o600)
     owner = invoking_user()
-    if owner is not None and (st.st_uid, st.st_gid) != owner:
+    if owner is not None and (st.st_uid, st.st_gid) != owner and _parent_owner(path) == owner[0]:
         try:
             os.fchown(fd, *owner)
         except OSError:
@@ -82,7 +97,7 @@ def open_private_append(path: str | Path):
     """Open a log file for appending: owner-only, never through a symbolic link."""
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(path, flags, 0o600)
-    secure_fd(fd)
+    secure_fd(fd, path)
     return fd
 
 
@@ -93,7 +108,7 @@ def write_private_atomic(path: str | Path, text: str) -> None:
     private_dir(p.parent)
     fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=f".{p.name}.", suffix=".tmp")
     try:
-        secure_fd(fd)
+        secure_fd(fd, tmp)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
             fh.flush()

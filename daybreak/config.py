@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import ipaddress
+import math
 import os
 import types
 import typing
@@ -446,9 +447,10 @@ def _validate(cfg: Config) -> None:
     for ch in cfg.sensor.channels:
         if not 1 <= ch <= 233:
             raise ConfigError(f"sensor.channels: invalid channel {ch}")
-    for key in ("dwell_time", "health_check_interval"):
-        if getattr(cfg.sensor, key) <= 0:
-            raise ConfigError(f"sensor.{key} must be positive")
+    for key, minimum in (("dwell_time", 0.1), ("health_check_interval", 1.0)):
+        value = getattr(cfg.sensor, key)
+        if not (isinstance(value, (int, float)) and math.isfinite(value) and value >= minimum):
+            raise ConfigError(f"sensor.{key} must be at least {minimum:g} seconds")
     if cfg.sensor.interface in cfg.sensor.protected_interfaces:
         raise ConfigError(
             f"sensor.interface {cfg.sensor.interface!r} is listed in sensor.protected_interfaces; "

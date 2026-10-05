@@ -82,7 +82,7 @@ class FakeRunner(CommandRunner):
         self.on_mutate = on_mutate
         self.executed: list[list[str]] = []
 
-    def run(self, argv, *, mutating: bool = False, guard=None) -> CommandResult:
+    def run(self, argv, *, mutating: bool = False, guard=None, timeout=None) -> CommandResult:
         argv = list(argv)
         mutating = checked_command(argv, mutating, guard)  # the runtime allow-list and guard apply to every test
         self.history.append(argv)

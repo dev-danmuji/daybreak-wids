@@ -232,8 +232,14 @@ def _sensor_operation(app: App, action: str, apply: bool, channel: int | None) -
     for argv in plan:
         click.echo("  " + " ".join(argv))
     missing = guard.missing_configured()
-    problem = (f"protected interface(s) {', '.join(missing)} not found: fix sensor.protected_interfaces "
-               "(a misspelled name protects nothing)") if missing else None
+    problem = None
+    if missing:
+        msg = (f"protected interface(s) {', '.join(missing)} not found: fix sensor.protected_interfaces "
+               "(a misspelled name protects nothing)")
+        if action == "prepare":
+            problem = msg
+        else:  # handing the sensor back must stay possible
+            click.echo(f"warning: {msg}", err=True)
     if problem is None:
         why = sensor_identity_problem(cfg.sensor, disc.interface(cfg.sensor.interface),
                                       require_disconnected=action == "prepare")
@@ -365,12 +371,18 @@ class SensorRecovery:
     def __init__(self, cfg: Any, guard: InterfaceGuard, runner: CommandRunner):
         self.cfg, self.guard, self.runner = cfg, guard, runner
         self.disabled: str | None = None
+        self.last_protected_changes: dict[str, list[str]] | None = None
 
     def problem(self, interface: str, found: Any) -> str | None:
         """Why ``interface`` must not be re-prepared (None: it is the configured, idle sensor)."""
+        missing = self.guard.missing_configured() if self.guard is not None else []
+        if missing:
+            return f"configured protected interface(s) {', '.join(missing)} not found"
         why = sensor_identity_problem(self.cfg.sensor, found, require_disconnected=True)
-        if why is None and interface != self.cfg.sensor.interface and not self.cfg.sensor.expected_mac:
-            why = "it is not the configured sensor name, and no sensor.expected_mac identifies the adapter"
+        sc = self.cfg.sensor
+        if why is None and interface != sc.interface and not (sc.expected_mac and sc.expected_driver):
+            why = ("it is not the configured sensor name; recognising a renamed adapter needs both "
+                   "sensor.expected_mac and sensor.expected_driver")
         return why
 
     def is_sensor(self, interface: str, found: Any) -> bool:
@@ -403,6 +415,7 @@ class SensorRecovery:
                                expected_mac=self.cfg.sensor.expected_mac)
         report = ctl.prepare(channels[0] if channels else None)
         if report.protected_changes:
+            self.last_protected_changes = dict(report.protected_changes)
             self.disabled = f"protected interface changed during recovery: {report.protected_changes}"
             click.echo(f"auto_prepare stopped: {self.disabled}", err=True)
             return False
@@ -676,6 +689,8 @@ def baseline_create(app: App, duration, replay, pcap, from_db, since, backend_ki
             builder.add_ap_row(row)
         db.close()
     else:
+        if replay is None and pcap is None:
+            click.echo(f"config: {app.config_source()}", err=True)
         backend, health, recover, guard = _build_live(app, backend_kind, replay, pcap, False, 1.0)
         if replay is None and pcap is None:
             duration = duration or cfg.detection.baseline.default_duration
