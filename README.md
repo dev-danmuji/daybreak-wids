@@ -643,7 +643,8 @@ Without any config file, data goes to `~/.local/share/daybreak-wids/`. Files are
 created owner-only (`0600`, directories `0700`). The live monitor deletes events,
 alerts, sensor status and station/AP records older than `storage.retention_days` (30
 by default, checked hourly; `0` keeps everything) and then truncates the SQLite WAL
-file; replays and pcap analysis never prune. Protected networks and baselines are
+file (postponed to the next prune while another process is reading the database);
+replays and pcap analysis never prune. Protected networks and baselines are
 kept. During floods only a sample of events, new station rows and new rows for
 unregistered APs is stored. `var/`, `config.yaml`, `networks.yaml`, databases, logs,
 `.env` and packet captures are git-ignored.

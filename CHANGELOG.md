@@ -98,17 +98,21 @@ Fixed before release, from an internal review of Daybreak itself (details in
 - **Data and privacy**: owner-only runtime files, handed back to the sudo user;
   logs never opened through symbolic links, registry and status written via
   `mkstemp`; symlinked database path refused; `storage.retention_days` enforced
-  (database and rotated logs; the WAL is truncated after pruning); SQLite
-  `secure_delete`; event metadata limited to scalar values; Kismet alerts
-  attributed only by registered BSSID or the whole quoted SSID; control,
-  line-separator and invisible format characters escaped in console, log and CLI
-  output; desktop notifications as plain text, never as root (monitor start says
+  (database and rotated logs; the WAL is truncated after pruning, or at the next
+  prune while another process is reading); SQLite `secure_delete`; event
+  metadata limited to scalar values; Kismet alerts attributed only by registered
+  BSSID or the whole quoted SSID; control and format characters, line separators
+  and lone surrogates (Unicode Cc, Cf, Zl, Zp, Cs) escaped in console, log and
+  CLI output; desktop notifications as plain text, never as root (monitor start says
   so), with a minimal environment; notifier options allow-listed, secret-like
   ones refused when the configuration is loaded.
-- **Robustness under floods**: size-capped detector state (registered BSSIDs
-  never evicted), expiry also every 10,000 events; event rows sampled per
-  (event type, BSSID) and overall, new station rows and rows for unregistered
-  APs budgeted (detection still sees every event); bounded alert bookkeeping and
+- **Robustness under floods**: detector state, incidents and disconnect
+  bookkeeping capped when keys are added (registered BSSIDs and their stations
+  are kept), so frozen timestamps cannot grow them either; event rows sampled
+  per (event type, BSSID) and, for unregistered BSSIDs, overall; new station
+  rows budgeted per registered BSSID and for all others together; new rows for
+  unregistered APs budgeted per SSID and, for SSIDs that are not protected,
+  overall (detection still sees every event); bounded alert bookkeeping and
   per-type limits for new alerts outside the protected networks; notification
   budgets per severity band; failing alert or status writes counted, never
   fatal; an event whose processing fails is counted and monitoring continues.
@@ -116,10 +120,12 @@ Fixed before release, from an internal review of Daybreak itself (details in
   timestamps rejected at ingestion and never able to break date formatting of
   stored data; malformed JSONL lines (oversized numbers, infinite values, deep
   nesting) counted instead of aborting a replay; undecodable bytes in replay
-  files read as malformed lines; a corrupt capture ends the run with the frames
+  files replaced (U+FFFD), and lines that no longer parse counted as malformed;
+  a corrupt capture ends the run with the frames
   before the bad block analysed; lone surrogates cleaned before storage
   (including security-profile strings); hostile Kismet records (non-string
-  texts, non-identifier headers, implausible times, infinite numbers) handled;
+  texts, non-identifier headers, implausible times, NaN / infinite / oversized
+  numbers) handled;
   a single far-off timestamp cannot hold a detection window open; failing
   database writes dropped and counted; bounded baseline window and candidate
   list; control characters escaped in the text report.
