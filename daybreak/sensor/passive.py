@@ -4,7 +4,7 @@ Opens a *receive-only* ``AF_PACKET`` socket on a monitor-mode sensor
 interface and converts frames to metadata events. The socket is wrapped in
 :class:`ReceiveOnlySocket`, which exposes no transmit operation at all; the
 package's static safety tests forbid send/write calls in this module.
-Requires CAP_NET_RAW (root or ``setcap cap_net_raw+ep``).
+Requires CAP_NET_RAW (run as root; do not give file capabilities to a shared Python interpreter).
 """
 
 from __future__ import annotations
@@ -97,7 +97,7 @@ class PassiveBackend(Backend):
         try:
             self._sock = self.socket_factory(self.interface)
         except PermissionError as exc:
-            raise BackendUnavailable("raw capture needs CAP_NET_RAW (run as root or setcap)") from exc
+            raise BackendUnavailable("raw capture needs CAP_NET_RAW (run the monitor with sudo)") from exc
         except OSError as exc:
             raise BackendUnavailable(f"cannot open capture on {self.interface}: {exc}") from exc
         self._failed = None

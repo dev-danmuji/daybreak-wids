@@ -199,6 +199,23 @@ def test_eventbus_subscribes_and_queues():
     assert "ALERT" in first and "DATASOURCE_ERROR" in second
 
 
+def test_eventbus_reconnects_after_a_dropped_connection():
+    attempts = []
+
+    def connect(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise ConnectionError("connection refused")      # Kismet restarting
+        return FakeWS([json.dumps({"ALERT": alert("DEAUTHFLOOD", NOW + 7)})])
+
+    q = queue.Queue()
+    reader = EventbusReader("ws://127.0.0.1:1/eventbus/events.ws", q, connect=connect, reconnect_delay=0.05)
+    reader.start()
+    msg = q.get(timeout=2)
+    reader.stop()
+    assert len(attempts) >= 2 and "ALERT" in msg and reader.last_error
+
+
 def test_backend_uses_eventbus_alerts(kismet):
     ws = FakeWS([json.dumps({"ALERT": alert("CRYPTODROP", NOW + 3)})])
     cfg = KismetConfig(url=kismet.url, use_eventbus=True, frame_tap=False, poll_interval=60)

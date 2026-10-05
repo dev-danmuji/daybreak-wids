@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from ..config import Config, ProtectedNetwork
 from ..models import (
@@ -87,10 +87,23 @@ class APState:
 
 
 class APTracker:
-    """Per-BSSID view built from beacons / probe responses / Kismet AP records."""
+    """Per-BSSID view built from beacons / probe responses / Kismet AP records.
 
-    def __init__(self):
-        self.aps: dict[str, APState] = {}
+    Bounded: beyond ``max_aps`` the least recently seen BSSID that is not registered
+    (``keep``) is forgotten, so a flood of random BSSIDs cannot grow memory without limit.
+    """
+
+    def __init__(self, max_aps: int = 4096, keep: Callable[[str], bool] | None = None):
+        self.aps: OrderedDict[str, APState] = OrderedDict()
+        self.max_aps = max_aps
+        self.keep = keep or (lambda bssid: False)
+        self.evicted = 0
+
+    def _evict(self) -> None:
+        victim = next((b for b in self.aps if not self.keep(b)), None)
+        if victim is not None:
+            del self.aps[victim]
+            self.evicted += 1
 
     def observe(self, ev: Event) -> tuple[APState, APState | None]:
         """Record an AP observation. Returns (current state, snapshot before the update)."""
@@ -98,7 +111,10 @@ class APTracker:
         prev = None
         if st is None:
             st = self.aps[ev.bssid] = APState(ev.bssid, ev.ssid, ev.timestamp, ev.timestamp)
+            if len(self.aps) > self.max_aps:
+                self._evict()
         else:
+            self.aps.move_to_end(ev.bssid)
             prev = APState(st.bssid, st.ssid, st.first_seen, st.last_seen, st.channel, set(st.channels),
                            st.security, deque(st.history, maxlen=16), st.rssi, dict(st.phy), st.observations)
         st.last_seen = max(st.last_seen, ev.timestamp)
@@ -123,7 +139,10 @@ class APTracker:
 
 
 class StationTracker:
-    """Which stations were recently seen talking to which BSSID."""
+    """Which stations were recently seen talking to which BSSID (bounded per BSSID and overall)."""
+
+    MAX_PER_BSSID = 1024
+    MAX_BSSIDS = 4096
 
     def __init__(self, ttl: float = 900.0):
         self.ttl = ttl
@@ -133,7 +152,15 @@ class StationTracker:
         if not ev.bssid or not ev.station or is_group_address(ev.station):
             return
         if ev.event_type in CONNECT_TYPES or ev.event_type is EventType.EAPOL:
-            self.seen.setdefault(ev.bssid, {})[ev.station] = ev.timestamp
+            stations = self.seen.setdefault(ev.bssid, {})
+            stations[ev.station] = ev.timestamp
+            if len(stations) > self.MAX_PER_BSSID:
+                for s in [s for s, t in stations.items() if ev.timestamp - t > self.ttl]:
+                    del stations[s]
+                while len(stations) > self.MAX_PER_BSSID:
+                    del stations[min(stations, key=stations.__getitem__)]
+            if len(self.seen) > self.MAX_BSSIDS:
+                del self.seen[min(self.seen, key=lambda b: max(self.seen[b].values(), default=0.0))]
 
     def associated(self, bssid: str, now: float) -> set[str]:
         stations = self.seen.get(bssid, {})
@@ -147,7 +174,7 @@ class DetectionContext:
     def __init__(self, config: Config, registry: NetworkRegistry, *, baseline: Any = None):
         self.config = config
         self.registry = registry
-        self.aps = APTracker()
+        self.aps = APTracker(keep=lambda bssid: registry.by_bssid(bssid) is not None)
         self.stations = StationTracker()
         self.baseline = baseline  # daybreak.baseline.engine.BaselineStore or None
         self.last_ap_update: tuple[APState, APState | None] | None = None

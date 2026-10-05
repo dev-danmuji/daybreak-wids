@@ -67,11 +67,18 @@ class SpoofDetector:
         self.cfg = cfg
         self._reported: dict[tuple, float] = {}
 
+    MAX_REPORTED = 4096
+
     def _once(self, key: tuple, ts: float) -> bool:
         last = self._reported.get(key)
         if last is not None and ts - last < REPORT_INTERVAL:
             return False
         self._reported[key] = ts
+        if len(self._reported) > self.MAX_REPORTED:  # e.g. a flood of random BSSIDs
+            recent = {k: t for k, t in self._reported.items() if ts - t < REPORT_INTERVAL}
+            if len(recent) > self.MAX_REPORTED:
+                recent = dict(sorted(recent.items(), key=lambda kv: kv[1])[-(self.MAX_REPORTED // 2):])
+            self._reported = recent
         return True
 
     def _reference(self, net: ProtectedNetwork, ctx: DetectionContext) -> SecurityProfile | None:

@@ -478,7 +478,9 @@ def monitor_start(app: App, backend_kind, replay, pcap, realtime, speed, duratio
     click.echo(f"\nprocessed {st.get('processed', 0)} events ({st.get('duplicates', 0)} duplicates, "
                f"{st.get('out_of_scope', 0)} out of scope, {backend.stats.get('malformed', 0)} malformed); "
                f"alerts delivered {summary['alerts'].get('delivered', 0)}, "
-               f"suppressed {summary['alerts'].get('suppressed', 0)}; threat level {summary['threat_level']}",
+               f"suppressed {summary['alerts'].get('suppressed', 0)}; threat level {summary['threat_level']}"
+               + (f"; flood sampling: {st.get('events_not_stored', 0)} events and {st.get('aps_not_stored', 0)} "
+                  "AP rows not stored" if st.get("events_not_stored") or st.get("aps_not_stored") else ""),
                err=True)
     if backend.errors and app.verbose:
         for e in backend.errors[-10:]:

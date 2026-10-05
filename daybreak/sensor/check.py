@@ -149,5 +149,5 @@ def _check_sensor(cfg: Config, iface: WirelessInterface, guard: InterfaceGuard,
     if "CAP_NET_RAW" in caps:
         report.add("privileges", OK, "CAP_NET_RAW available (passive frame capture possible)")
     else:
-        report.add("privileges", INFO, "no CAP_NET_RAW: passive frame capture needs root or "
-                   "`setcap cap_net_raw+ep`; the Kismet backend works without it")
+        report.add("privileges", INFO, "no CAP_NET_RAW: passive frame capture needs root (run the monitor "
+                   "with sudo); the Kismet backend works without it")

@@ -439,3 +439,60 @@ def test_retention_removes_old_rotated_log_files(tmp_path):
     MonitorRunner(rt, FakeBackend([]), duration=2, clock=FakeClock(start=T0), sleep=lambda s: None).run()
     assert not old.exists() and fresh.exists() and other.exists()
     rt.close()
+
+
+# -- bounded state and storage under floods ----------------------------------------------------------
+
+def test_beacon_flood_with_random_bssids_keeps_state_and_storage_bounded(tmp_path):
+    from conftest import HOME_BSSID
+    from daybreak.models import Event, EventType
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path))
+    p = rt.pipeline
+    t0 = 1_790_000_000.0
+    for i in range(10_000):  # 100 beacons/s for 100 s, each from a new random BSSID
+        p.process(Event(t0 + i * 0.01, EventType.BEACON, bssid=f"02:00:00:{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:"
+                        f"{i & 255:02X}", ssid="ExampleSSID", channel=36))
+        if i % 100 == 0:  # the registered AP keeps beaconing
+            p.process(Event(t0 + i * 0.01 + 0.005, EventType.BEACON, bssid=HOME_BSSID, ssid="ExampleSSID",
+                            channel=36))
+    p.flush()
+    assert len(p.ctx.aps.aps) <= p.ctx.aps.max_aps and HOME_BSSID in p.ctx.aps.aps
+    spoof = next(d for d in p.detectors if d.name == "spoof")
+    assert len(spoof._reported) <= spoof.MAX_REPORTED
+    rows = rt.db.count_aps(ssid="ExampleSSID", exclude_bssids=[HOME_BSSID])
+    assert rows <= 256 + 100 * 256 / 3600 + 1 and p.stats["aps_not_stored"] == 10_000 - rows
+    assert rt.db.list_alerts(alert_type="UNKNOWN_BSSID_FOR_PROTECTED_SSID")  # the flood is still reported
+    rt.close()
+
+
+def test_deauth_flood_is_detected_while_storage_is_sampled(tmp_path):
+    from conftest import HOME_BSSID
+    from daybreak.models import Event
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path))
+    t0 = 1_790_000_000.0
+    for i in range(5000):  # 1000 frames/s for 5 s
+        rt.pipeline.process(Event.from_dict({"ts": t0 + i * 0.001, "type": "deauth", "bssid": HOME_BSSID,
+                                             "src": HOME_BSSID, "dst": "FF:FF:FF:FF:FF:FF", "reason": 7,
+                                             "seq": i % 4096}))
+    rt.pipeline.flush()
+    stored = rt.db.event_counts(since=0)["deauth"]
+    assert 500 <= stored <= 500 + 50 * 5 + 1
+    assert rt.pipeline.stats["events_not_stored"] == 5000 - stored
+    assert rt.db.list_alerts(alert_type="POSSIBLE_DEAUTH_ATTACK")  # detection saw every frame
+    rt.close()
+
+
+def test_station_tracker_is_bounded():
+    from daybreak.detectors.base import StationTracker
+    from daybreak.models import Event, EventType
+
+    tracker = StationTracker()
+    for i in range(3000):
+        tracker.observe(Event(1.0 + i, EventType.ASSOC, bssid="AA:BB:CC:DD:EE:FF",
+                              station=f"10:00:00:00:{i >> 8:02X}:{i & 255:02X}"))
+    assert len(tracker.seen["AA:BB:CC:DD:EE:FF"]) <= tracker.MAX_PER_BSSID
+    assert "10:00:00:00:0B:B7" in tracker.seen["AA:BB:CC:DD:EE:FF"]  # the most recent station is kept

@@ -20,6 +20,39 @@ from .models import (
 from .registry import NetworkRegistry
 
 
+class StorageBudget:
+    """Token bucket per key (event time): during a flood only a sample is written to the
+    database. Detection still sees every event; the skipped ones are counted."""
+
+    def __init__(self, rate: float, burst: float, max_keys: int = 4096):
+        self.rate = rate
+        self.burst = burst
+        self.max_keys = max_keys
+        self._buckets: OrderedDict[Any, list[float]] = OrderedDict()
+
+    def allow(self, key: Any, now: float) -> bool:
+        bucket = self._buckets.get(key)
+        if bucket is None:
+            bucket = self._buckets[key] = [self.burst, now]
+            if len(self._buckets) > self.max_keys:
+                self._buckets.popitem(last=False)
+        else:
+            self._buckets.move_to_end(key)
+            bucket[0] = min(self.burst, bucket[0] + max(0.0, now - bucket[1]) * self.rate)
+            bucket[1] = max(bucket[1], now)
+        if bucket[0] >= 1.0:
+            bucket[0] -= 1.0
+            return True
+        return False
+
+
+# Stored per (event type, BSSID): a burst of 500, then 50 per second.
+EVENT_STORAGE_RATE, EVENT_STORAGE_BURST = 50.0, 500.0
+# New database rows for unregistered BSSIDs advertising a protected SSID: 256 per SSID and hour.
+UNKNOWN_AP_ROWS_PER_HOUR = 256
+MAX_AP_WRITE_KEYS = 8192
+
+
 class Deduplicator:
     """Drops exact duplicates and 802.11 retransmissions (retry bit + same sequence)."""
 
@@ -107,7 +140,9 @@ class Pipeline:
         self._events: list[Event] = []
         self._stations: Counter[tuple[str, str, str]] = Counter()
         self._station_seen: dict[tuple[str, str], float] = {}
-        self._ap_written: dict[tuple[str, str], tuple[float, Any, int | None]] = {}
+        self._ap_written: OrderedDict[tuple[str, str], tuple[float, Any, int | None]] = OrderedDict()
+        self._event_budget = StorageBudget(EVENT_STORAGE_RATE, EVENT_STORAGE_BURST)
+        self._unknown_ap_budget = StorageBudget(UNKNOWN_AP_ROWS_PER_HOUR / 3600.0, UNKNOWN_AP_ROWS_PER_HOUR)
         self._last_flush = time.monotonic()
         self._last_expire: float | None = None
         self.last_event_ts: float | None = None
@@ -203,8 +238,10 @@ class Pipeline:
             return
         if ev.event_type in AP_OBSERVATION_TYPES:
             self._store_ap(ev)
-        else:
+        elif self._event_budget.allow((ev.event_type.value, ev.bssid), ev.timestamp):
             self._events.append(ev)
+        else:
+            self.stats["events_not_stored"] += 1
         if ev.station and ev.bssid:
             kind = ("eapol" if ev.event_type is EventType.EAPOL else
                     "disconnect" if ev.event_type in DISCONNECT_TYPES else
@@ -221,8 +258,15 @@ class Pipeline:
         sec = ev.security
         if last and ev.timestamp - last[0] < 60.0 and last[1] == sec and last[2] == ev.channel:
             return
-        self._ap_written[key] = (ev.timestamp, sec, ev.channel)
         authorized = self.registry.is_authorized(ev.ssid, ev.bssid)
+        if last is None and authorized is not True and \
+                not self._unknown_ap_budget.allow(ev.ssid or "", ev.timestamp):
+            self.stats["aps_not_stored"] += 1  # beacon flood with random BSSIDs: keep a sample
+            return
+        self._ap_written[key] = (ev.timestamp, sec, ev.channel)
+        self._ap_written.move_to_end(key)
+        if len(self._ap_written) > MAX_AP_WRITE_KEYS:
+            self._ap_written.popitem(last=False)
         net = self.registry.network_of(ev)
         self.db.upsert_ap(bssid=ev.bssid, ssid=ev.ssid, network_id=self.network_ids.get(net.name) if net else None,
                           authorized=authorized, channel=ev.channel, security=sec,
@@ -246,4 +290,5 @@ class Pipeline:
                                        eapol=counts["eapol"], disconnect=counts["disconnect"],
                                        connect=counts["connect"])
             self._stations.clear()
+            self._station_seen.clear()
         self._last_flush = time.monotonic()
