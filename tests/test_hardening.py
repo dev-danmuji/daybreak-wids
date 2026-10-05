@@ -1654,3 +1654,27 @@ def test_monitor_status_escapes_the_interface_name(tmp_path):
                                             "sensor": {"interface": "wlx\x1b]0;pwned\x07", "online": False}}))
     out = CliRunner().invoke(cli.main, ["-c", str(path), "monitor", "status"]).output
     assert "\x1b" not in out and "\x07" not in out
+
+
+def test_random_bssid_and_station_floods_cannot_fill_the_database(tmp_path):
+    from daybreak.pipeline import (
+        EVENT_STORAGE_TOTAL_BURST, EVENT_STORAGE_TOTAL_RATE, NEW_STATION_ROWS_PER_HOUR,
+    )
+    from daybreak.models import Event
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path))
+    t0 = 1_790_000_000.0
+    for i in range(20_000):  # 1000 frames/s for 20 s: random BSSIDs and stations, aimed at the protected AP
+        n = f"{i >> 16 & 255:02X}:{i >> 8 & 255:02X}:{i & 255:02X}"
+        rt.pipeline.process(Event.from_dict({"ts": t0 + i / 1000, "type": "deauth", "bssid": f"02:60:00:{n}",
+                                             "src": f"02:70:00:{n}", "dst": "AA:BB:CC:DD:EE:FF", "reason": 7}))
+        if i % 200 == 0:
+            rt.pipeline.flush()
+    rt.pipeline.flush()
+    events = rt.db.conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    stations = rt.db.conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0]
+    assert events <= EVENT_STORAGE_TOTAL_BURST + 20 * EVENT_STORAGE_TOTAL_RATE + 1
+    assert stations <= NEW_STATION_ROWS_PER_HOUR * (1 + 20 / 3600) + 1
+    assert rt.pipeline.stats["events_not_stored"] == 20_000 - events  # detection still saw them all
+    rt.close()

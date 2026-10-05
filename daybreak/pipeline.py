@@ -48,12 +48,17 @@ class StorageBudget:
         return False
 
 
-# Stored per (event type, BSSID): a burst of 500, then 50 per second.
+# Stored per (event type, BSSID): a burst of 500, then 50 per second; and overall a burst of 1000,
+# then 100 per second (a flood from random BSSIDs would get a fresh burst for every BSSID).
 EVENT_STORAGE_RATE, EVENT_STORAGE_BURST = 50.0, 500.0
+EVENT_STORAGE_TOTAL_RATE, EVENT_STORAGE_TOTAL_BURST = 100.0, 1000.0
 # New database rows for unregistered BSSIDs: 256 per SSID and hour, and 1024 per hour over all
 # SSIDs (with detection.scope "all", a flood of random SSIDs would otherwise get 256 each).
 UNKNOWN_AP_ROWS_PER_HOUR = 256
 UNKNOWN_AP_ROWS_TOTAL_PER_HOUR = 1024
+# New station rows (a flood of random client MACs would add one per MAC): 1024 per hour.
+NEW_STATION_ROWS_PER_HOUR = 1024
+MAX_STATION_WRITE_KEYS = 8192
 MAX_AP_WRITE_KEYS = 8192
 
 
@@ -146,6 +151,9 @@ class Pipeline:
         self._station_seen: dict[tuple[str, str], float] = {}
         self._ap_written: OrderedDict[tuple[str, str], tuple[float, Any, int | None]] = OrderedDict()
         self._event_budget = StorageBudget(EVENT_STORAGE_RATE, EVENT_STORAGE_BURST)
+        self._event_total = StorageBudget(EVENT_STORAGE_TOTAL_RATE, EVENT_STORAGE_TOTAL_BURST)
+        self._station_budget = StorageBudget(NEW_STATION_ROWS_PER_HOUR / 3600.0, NEW_STATION_ROWS_PER_HOUR)
+        self._station_written: OrderedDict[tuple[str, str], None] = OrderedDict()
         self._unknown_ap_budget = StorageBudget(UNKNOWN_AP_ROWS_PER_HOUR / 3600.0, UNKNOWN_AP_ROWS_PER_HOUR)
         self._unknown_ap_total = StorageBudget(UNKNOWN_AP_ROWS_TOTAL_PER_HOUR / 3600.0, UNKNOWN_AP_ROWS_TOTAL_PER_HOUR)
         self._last_flush = time.monotonic()
@@ -251,7 +259,8 @@ class Pipeline:
             return
         if ev.event_type in AP_OBSERVATION_TYPES:
             self._store_ap(ev)
-        elif self._event_budget.allow((ev.event_type.value, ev.bssid), ev.timestamp):
+        elif self._event_budget.allow((ev.event_type.value, ev.bssid), ev.timestamp) and \
+                self._event_total.allow(None, ev.timestamp):
             self._events.append(ev)
         else:
             self.stats["events_not_stored"] += 1
@@ -309,6 +318,16 @@ class Pipeline:
             for (sta, bssid, kind), n in self._stations.items():
                 per_station.setdefault((sta, bssid), Counter())[kind] += n
             for (sta, bssid), counts in per_station.items():
+                key = (sta, bssid)
+                if key in self._station_written:
+                    self._station_written.move_to_end(key)
+                elif not self._station_budget.allow(None, self._station_seen[key]):
+                    self.stats["stations_not_stored"] += 1  # random client MACs: keep a sample
+                    continue
+                else:
+                    self._station_written[key] = None
+                    if len(self._station_written) > MAX_STATION_WRITE_KEYS:
+                        self._station_written.popitem(last=False)
                 net = self.registry.by_bssid(bssid)
                 try:
                     self.db.upsert_station(mac=sta, bssid=bssid,
