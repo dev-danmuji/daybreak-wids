@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daybreak-wids"
+version = "0.1.0"
+description = "Passive, defensive Wireless IDS for Wi-Fi networks you own or administer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "PyYAML>=6",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+# Kismet eventbus (websocket) support. Without it the Kismet REST API is polled.
+eventbus = ["websocket-client>=1.6"]
+# Optional local dashboard (binds to 127.0.0.1 by default).
+dashboard = ["fastapi>=0.110", "uvicorn>=0.27"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+daybreak-wids = "daybreak.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["daybreak*"]
+
+[tool.setuptools.package-data]
+daybreak = ["dashboard/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`"]

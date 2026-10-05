@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Daybreak WIDS</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>DAYBREAK WIDS</h1>
+      <span class="sub">Passive, authorized defensive monitoring</span>
+    </div>
+    <div class="threat" id="threat" data-level="NORMAL">
+      <span class="label">Threat Level</span>
+      <span class="value" id="threat-value">NORMAL</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" id="sensor-card">
+      <h2>Sensor</h2>
+      <div class="big" id="sensor-model">-</div>
+      <div class="mono" id="sensor-iface">-</div>
+      <div class="state" id="sensor-state" data-state="unknown">UNKNOWN</div>
+      <dl class="kv" id="sensor-kv"></dl>
+    </section>
+
+    <section class="card" id="networks-card">
+      <h2>Protected Networks</h2>
+      <div id="networks"></div>
+    </section>
+
+    <section class="card" id="last5-card">
+      <h2>Last 5 min</h2>
+      <dl class="counts" id="last5"></dl>
+      <div class="muted" id="monitor-line"></div>
+    </section>
+
+    <section class="card wide" id="alerts-card">
+      <h2>Current Alerts <span class="muted" id="alerts-note"></span></h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Time</th><th>Severity</th><th>Score</th><th>Type</th><th>BSSID</th><th>Why</th></tr></thead>
+          <tbody id="alerts"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card wide" id="timeline-card">
+      <h2>Event Timeline <span class="muted" id="timeline-note"></span></h2>
+      <div class="legend">
+        <span class="sw deauth"></span>deauth <span class="sw disassoc"></span>disassoc
+        <span class="sw eapol"></span>EAPOL <span class="sw connect"></span>(re)connect
+        <span class="sw alert"></span>alert
+      </div>
+      <svg id="timeline" viewBox="0 0 960 180" preserveAspectRatio="none" role="img"
+           aria-label="Events per minute"></svg>
+    </section>
+
+    <section class="card wide" id="security-card">
+      <h2>AP Security</h2>
+      <div id="security"></div>
+    </section>
+
+    <section class="card wide" id="baseline-card">
+      <h2>Baseline</h2>
+      <div id="baseline"></div>
+    </section>
+  </main>
+
+  <footer>
+    daybreak-wids is passive: it never transmits, injects, deauthenticates or cracks.
+    Read-only view, refreshed every 5 s.
+  </footer>
+</body>
+</html>

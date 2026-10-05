@@ -1,0 +1,3 @@
+# Verbatim captures of iw/nmcli output (anonymised). iw emits trailing spaces;
+# keep them so the parsers are tested against real output.
+tests/fixtures/host/*.txt -whitespace

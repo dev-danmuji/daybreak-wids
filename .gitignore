@@ -1,0 +1,38 @@
+# Python / tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and local environment (Kismet API keys are read from the environment)
+.env
+.env.*
+
+# Runtime data: metadata database, logs, monitor status, local validation records
+var/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# Local configuration and network registry (contain your SSIDs/BSSIDs)
+config.yaml
+networks.yaml
+
+# Never commit packet captures or Kismet logs: they can contain EAPOL handshakes
+*.pcap
+*.pcapng
+*.cap
+*.kismet
+*.kismetdb
+*.netxml

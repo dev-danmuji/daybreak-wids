@@ -1,0 +1,10 @@
+Interface wlx00c0cab85c32
+	ifindex 10
+	wdev 0x300000001
+	addr 00:c0:ca:b8:5c:32
+	type managed
+	wiphy 3
+	txpower 3.00 dBm
+	multicast TXQ:
+		qsz-byt	qsz-pkt	flows	drops	marks	overlmt	hashcol	tx-bytes	tx-packets
+		0	0	0	0	0	0	0	0		0

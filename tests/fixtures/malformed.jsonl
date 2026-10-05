@@ -1,0 +1,11 @@
+# Malformed and duplicate input handling. 3 valid events + 1 duplicate.
+{"ts":"2026-10-05T06:00:00.000Z","type":"beacon","bssid":"AA:BB:CC:DD:EE:FF","ssid":"ExampleSSID","channel":36,"security":{"akms":["SAE"],"pmf":"required"}}
+this is not json
+{"ts":"2026-10-05T06:00:01.000Z","type":"deauth","bssid":"not-a-mac"}
+{"type":"deauth","bssid":"AA:BB:CC:DD:EE:FF"}
+{"ts":"2026-10-05T06:00:02.000Z","type":"warp_drive","bssid":"AA:BB:CC:DD:EE:FF"}
+{"ts":"2026-10-05T06:00:03.000Z","type":"deauth","bssid":"AA:BB:CC:DD:EE:FF","channel":4000}
+[1,2,3]
+{"ts":"2026-10-05T06:00:04.000Z","type":"eapol","bssid":"AA:BB:CC:DD:EE:FF","src":"10:22:33:44:55:01","dst":"AA:BB:CC:DD:EE:FF","eapol_msg":2,"nonce":"redacted-not-real","mic":"redacted"}
+{"ts":"2026-10-05T06:00:05.000Z","type":"deauth","bssid":"AA:BB:CC:DD:EE:FF","src":"AA:BB:CC:DD:EE:FF","dst":"10:22:33:44:55:01","reason":7}
+{"ts":"2026-10-05T06:00:05.000Z","type":"deauth","bssid":"AA:BB:CC:DD:EE:FF","src":"AA:BB:CC:DD:EE:FF","dst":"10:22:33:44:55:01","reason":7}

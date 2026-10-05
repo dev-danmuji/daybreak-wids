@@ -1,0 +1,151 @@
+# daybreak-wids example configuration.
+# Copy to config.yaml and adjust. Relative paths are resolved against the
+# directory that contains this file.
+#
+# Authorized defensive monitoring only: register only networks you own or are
+# explicitly authorized to administer.
+
+sensor:
+  # Dedicated monitoring adapter (ALFA, MediaTek MT7921U).
+  interface: wlx00c0cab85c32
+  expected_driver: mt7921u
+  # Optional. Used to recognise the same adapter after a USB re-enumeration.
+  expected_mac: "00:C0:CA:B8:5C:32"
+  # Never modified by daybreak-wids (also: anything carrying the default route
+  # and any interface that shares a PHY with these).
+  protected_interfaces:
+    - wlo1
+  health_check_interval: 5
+  # Passive backend: channels to listen on. Empty = channels of protected networks.
+  channels: []
+  dwell_time: 0.5
+  # Passive backend only: re-enable monitor mode on the *sensor* after a USB reset.
+  auto_prepare: true
+
+backend:
+  # auto: use Kismet when reachable, otherwise the built-in passive backend.
+  type: auto
+  kismet:
+    url: http://127.0.0.1:2501
+    # Read-only Kismet API key, taken from this environment variable.
+    api_key_env: KISMET_API_KEY
+    username: null
+    password_env: KISMET_PASSWORD
+    poll_interval: 2.0
+    timeout: 5.0
+    use_eventbus: true
+    # Also read per-frame metadata (deauth/disassoc/EAPOL/beacon) from the
+    # monitor interface Kismet opened. Receive-only; needs CAP_NET_RAW.
+    frame_tap: true
+    datasource_check_interval: 10
+  passive:
+    # Monitor-mode interface to read from (defaults to sensor.interface).
+    interface: null
+
+safety:
+  # These are declarations, not switches. Any other value refuses to start.
+  passive_only: true
+  packet_injection: false
+  transmit_management_frames: false
+
+# Networks you administer. Without bssids a network is shown as "unconfigured"
+# and no nearby AP is ever adopted automatically.
+protected_networks:
+  - name: home
+    ssid: ExampleSSID
+    bssids:
+      - "AA:BB:CC:DD:EE:FF"
+    channels:
+      - 36
+    security:
+      expected:
+        - WPA2
+        - WPA3
+      # Optional expectation: disabled | capable | required
+      pmf: capable
+
+# Networks added with `daybreak-wids network add` are stored here.
+registry_file: networks.yaml
+
+detection:
+  # protected: analyse only frames that belong to protected networks.
+  # all: analyse every BSSID the sensor hears (alerts for neighbours too).
+  scope: protected
+  deauth:
+    burst_threshold: 10        # more than 10 frames ...
+    burst_window: 5            # ... within 5 seconds
+    broadcast_threshold: 3
+    broadcast_window: 60
+    multi_client_threshold: 3
+    multi_client_window: 30
+    rssi_deviation_db: 20
+    suspicious_min_frames: 3
+    suspicious_window: 30
+  eapol:
+    station_window: 60
+    station_handshake_threshold: 3
+    station_frame_threshold: 12
+    bssid_window: 60
+    bssid_frame_threshold: 40
+    bssid_station_threshold: 4
+  spoof:
+    enabled: true
+    channel_anomaly: true
+  correlation:
+    window: 120
+    reconnect_window: 30
+  baseline:
+    bucket: 60
+    z_threshold: 3.0
+    min_sigma: 0.5
+    min_count: 5
+    default_duration: 900
+
+scoring:
+  weights:
+    deauth_burst: 30
+    broadcast_deauth: 20
+    multi_client_deauth: 15
+    suspicious_source: 15
+    invalid_reason_code: 5
+    eapol_reauth_surge: 17
+    reconnect_after_disconnect: 10
+    baseline_deviation: 15
+    unknown_bssid: 30
+    security_downgrade: 30
+    encryption_change: 15
+    pmf_downgrade: 15
+    channel_anomaly: 10
+    incompatible_duplicate: 20
+    concurrent_deauth: 15
+    kismet_other: 10
+    sensor_lost: 50
+
+alerts:
+  cooldown: 300               # seconds before the same alert may repeat
+  escalation_delta: 10        # ...unless its score rises by at least this much
+  rate_limit_per_minute: 20   # per notifier
+  notifiers:
+    - type: console
+      min_severity: LOW
+    - type: jsonl
+      min_severity: INFO
+    - type: desktop
+      min_severity: HIGH
+
+storage:
+  database: var/daybreak.db
+  retention_days: 30
+
+logging:
+  directory: var/log
+  human_log: daybreak.log
+  jsonl_log: alerts.jsonl
+  max_bytes: 10485760
+  backup_count: 5
+  level: INFO
+
+dashboard:
+  host: 127.0.0.1
+  port: 8765
+  allow_remote: false

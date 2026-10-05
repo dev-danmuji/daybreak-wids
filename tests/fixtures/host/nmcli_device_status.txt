@@ -1,0 +1,10 @@
+wlo1:wifi:connected
+tun0:tun:connected (externally)
+docker0:bridge:connected (externally)
+lo:loopback:connected (externally)
+br-0123456789ab:bridge:connected (externally)
+wlx00c0cab85c32:wifi:disconnected
+p2p-dev-wlo1:wifi-p2p:disconnected
+p2p-dev-wlx00c0cab85c32:wifi-p2p:disconnected
+enp1s0:ethernet:unavailable
+veth0000001:ethernet:unmanaged
