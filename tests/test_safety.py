@@ -271,3 +271,35 @@ def test_enforce_passive_rejects(flags):
     from daybreak.safety import SafetyViolation, enforce_passive
     with pytest.raises(SafetyViolation):
         enforce_passive(flags)
+
+
+# -- Operator scripts ------------------------------------------------------------------------------
+
+SCRIPTS = sorted((PKG.parent / "scripts").glob("*.sh"))
+_SUDO_AT_COMMAND = re.compile(r"(?:^|[;&|({]|\$\(|\b(?:then|do|else)\b)\s*sudo\b((?:\$\([^)]*\)|[^;&|)])*)")
+_ALLOWED_SUDO = [
+    re.compile(r'^\s*"\$DAYBREAK" -c "\$CONFIG" "\$@"\s*$'),          # daybreak-wids itself (guarded)
+    re.compile(r'^\s*(-n )?kill -INT "\$MON_PID"( 2>/dev/null)?\s*$'),  # stop its own monitor
+    re.compile(r'^\s*chown -R -h "\$\(id -u\):\$\(id -g\)" var( 2>/dev/null)?\s*$'),  # hand back var/
+    re.compile(r"^\s*-n -v( 2>/dev/null)?\s*$"),                        # keep the timestamp alive
+]
+_MUTATING_NET = re.compile(r"\b(iw|ip|nmcli|iwconfig|ifconfig|rfkill)\b[^|;\n]*\b(set|add|del|delete|flush|"
+                           r"down|up|connect|disconnect|radio|modify|reapply|rescan|scan|wifi|on|off)\b")
+_ATTACK_TOOLS = re.compile(r"\b(aireplay|aircrack|airmon|airodump|mdk[34]|hcxdumptool|hcxpcapngtool|hashcat|"
+                           r"john|bettercap|wifite|reaver|bully|hostapd|tcpdump|tshark|dumpcap|scapy)\b", re.I)
+
+
+def test_operator_scripts_only_escalate_daybreak_itself():
+    """scripts/*.sh never run interface-changing tools or attack tools; sudo is used only for
+    daybreak-wids itself, to stop its own monitor, to hand var/ back, and to keep sudo alive."""
+    assert SCRIPTS
+    for path in SCRIPTS:
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            code = re.sub(r"\s+#\s.*$", "", line)
+            assert not _ATTACK_TOOLS.search(code), f"{path.name}:{lineno}: {line.strip()}"
+            assert not _MUTATING_NET.search(code), f"{path.name}:{lineno} changes an interface: {line.strip()}"
+            for m in _SUDO_AT_COMMAND.finditer(code):
+                assert any(p.match(m.group(1)) for p in _ALLOWED_SUDO), \
+                    f"{path.name}:{lineno} escalates something else: sudo{m.group(1)}"
