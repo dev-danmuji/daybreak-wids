@@ -152,6 +152,26 @@ def test_backend_reports_datasource_failure(kismet):
     assert st.sensor_ok is False and "Interface went away" in st.detail
 
 
+def test_backend_status_says_whether_the_frame_tap_is_active(kismet):
+    class Tap:
+        def open(self):
+            pass
+
+        def close(self):
+            pass
+
+    def no_tap(iface):
+        raise OSError(1, "Operation not permitted")
+
+    cfg = KismetConfig(url=kismet.url, use_eventbus=False, frame_tap=True)
+    for factory, expected in ((lambda iface: Tap(), "frame tap active"),
+                              (no_tap, "no frame tap (frame tap on wlx00c0cab85c32mon unavailable")):
+        b = KismetBackend(cfg, sensor_interface=ALFA, client=client_for(kismet), frame_tap_factory=factory)
+        b.open()
+        assert expected in b.status().detail  # shown by `monitor status` and the monitor's start line
+        b.close()
+
+
 def test_backend_becomes_unavailable_mid_run(kismet):
     cfg = KismetConfig(url=kismet.url, use_eventbus=False, frame_tap=False, poll_interval=0.01)
     b = KismetBackend(cfg, sensor_interface=ALFA, client=client_for(kismet), sleep=lambda s: None)
@@ -252,6 +272,29 @@ def test_eventbus_sends_credentials_as_headers_without_proxy(monkeypatch):
         reader._open()
     assert "KISMET" not in seen["url"] and seen["header"] == ["Cookie: KISMET=k"]
     assert seen["http_no_proxy"] == ["*"]
+
+
+def test_eventbus_never_follows_a_redirect(monkeypatch):
+    websocket = pytest.importorskip("websocket")
+    core = pytest.importorskip("websocket._core")
+    from websocket._handshake import handshake_response
+
+    class Sock:
+        def close(self):
+            pass
+
+    handshakes = []
+
+    def fake_handshake(sock, url, *addrs, **options):  # no socket: the library's own redirect loop runs
+        handshakes.append((url, options.get("header")))
+        return handshake_response(302, {"location": "ws://attacker.example/eventbus/events.ws"}, None)
+
+    monkeypatch.setattr(core, "connect", lambda url, *a, **k: (Sock(), ("127.0.0.1", 2501, "/eventbus/events.ws")))
+    monkeypatch.setattr(core, "handshake", fake_handshake)
+    reader = EventbusReader(eventbus_url("http://127.0.0.1:2501"), queue.Queue(), headers={"Cookie": "KISMET=k"})
+    with pytest.raises(websocket.WebSocketException, match="[Rr]edirect"):
+        reader._open()
+    assert len(handshakes) == 1 and handshakes[0][0].startswith("ws://127.0.0.1:2501/")
 
 
 def test_client_refuses_redirects(kismet):

@@ -469,8 +469,9 @@ class EventbusReader(threading.Thread):
         if self._connect is not None:
             return self._connect(self.url)
         import websocket
-        # Credentials as headers; like the REST client, never through an environment proxy.
-        return websocket.create_connection(self.url, timeout=10, http_no_proxy=["*"],
+        # Credentials as headers; like the REST client, never through an environment proxy and
+        # never to a redirect target (websocket-client would resend the headers there).
+        return websocket.create_connection(self.url, timeout=10, http_no_proxy=["*"], redirect_limit=0,
                                            header=[f"{k}: {v}" for k, v in self.headers.items()])
 
     def run(self) -> None:
@@ -671,6 +672,10 @@ class KismetBackend(Backend):
             detail += f"; no datasource for {self.sensor_interface}"
         elif not sensor_ok:
             detail += f"; datasource {ds.name} not running: {ds.error_reason or 'unknown'}"
+        if self.frame_tap is not None:
+            detail += "; frame tap active"
+        elif self.cfg.frame_tap:
+            detail += f"; no frame tap ({self.frame_tap_error or 'not opened'}): Kismet alerts and AP records only"
         return BackendStatus(
             self.name, self._healthy, detail, sensor_ok=sensor_ok,
             extra={
