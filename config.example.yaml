@@ -6,7 +6,8 @@
 # explicitly authorized to administer.
 
 sensor:
-  # Dedicated monitoring adapter (ALFA, MediaTek MT7921U).
+  # Dedicated monitoring adapter (ALFA, MediaTek MT7921U). `sensor prepare` refuses an
+  # adapter whose driver (or MAC, if set) differs: take the values from `sensor list`.
   interface: wlx00c0cab85c32
   expected_driver: mt7921u
   # Optional. Used to recognise the same adapter after a USB re-enumeration.
@@ -129,7 +130,7 @@ scoring:
 alerts:
   cooldown: 300               # seconds before the same alert may repeat
   escalation_delta: 10        # ...unless its score rises by at least this much
-  rate_limit_per_minute: 20   # per notifier
+  rate_limit_per_minute: 20   # per console/desktop notifier and severity band; JSONL is not limited
   notifiers:
     - type: console
       min_severity: LOW
@@ -146,6 +147,7 @@ storage:
 
 logging:
   directory: var/log
+  # File names inside `directory` (no path).
   human_log: daybreak.log
   jsonl_log: alerts.jsonl
   max_bytes: 10485760
@@ -156,6 +158,7 @@ dashboard:
   host: 127.0.0.1
   port: 8765
   # The dashboard has no authentication. Only with allow_remote may it bind to another
-  # address; the Host header must then match the bind address or one of allowed_hosts.
+  # address; the Host header must then match the bind address or one of allowed_hosts
+  # (literal host names or IP addresses, no wildcards or ports; required for 0.0.0.0 / ::).
   allow_remote: false
   allowed_hosts: []
