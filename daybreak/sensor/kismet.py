@@ -61,6 +61,14 @@ ENDPOINTS = {
     "active_logs": "/logging/active.json",
 }
 
+# The only request paths: anchored, timestamps formatted by this module (no dot-segments, no query).
+_TS = r"\d{1,12}\.\d{6}"
+ENDPOINT_PATTERNS = tuple(re.compile(p) for p in (
+    r"/system/status\.json", r"/datasource/all_sources\.json", r"/alerts/definitions\.json",
+    rf"/alerts/wrapped/last-time/{_TS}/alerts\.json", rf"/devices/last-time/{_TS}/devices\.json",
+    r"/logging/active\.json",
+))
+
 _SSID = "dot11.device/dot11.device.last_beaconed_ssid_record/"
 # [kismet field path, local name] -- the complete list of device fields we request.
 SAFE_DEVICE_FIELDS: list[list[str]] = [
@@ -143,7 +151,7 @@ class KismetClient:
         return {"Accept": "application/json", "User-Agent": "daybreak-wids", **self.auth_headers()}
 
     def request(self, path: str, *, fields: list | None = None) -> Any:
-        if not any(path.startswith(p.split("{")[0]) for p in ENDPOINTS.values()):
+        if not any(p.fullmatch(path) for p in ENDPOINT_PATTERNS):
             raise KismetError(f"endpoint not allow-listed: {path}")
         data = None
         headers = self._headers()

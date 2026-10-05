@@ -5,6 +5,8 @@ To add a channel (Slack, Discord, Telegram, e-mail, webhook, ...), subclass
 
     @register_notifier("webhook")
     class WebhookNotifier(Notifier):
+        CONFIG_OPTIONS = frozenset({"url"})  # option names allowed in alerts.notifiers[].options
+
         def __init__(self, min_severity="HIGH", url="", **options):
             super().__init__(min_severity, **options)
             self.url = url
@@ -19,11 +21,13 @@ Notifiers receive alert metadata only (never frames or key material).
 from __future__ import annotations
 
 import abc
+import re
 from typing import Any, Callable
 
 from ..models import Alert, Severity
 
 NOTIFIER_TYPES: dict[str, type["Notifier"]] = {}
+_SECRET_LIKE = re.compile(r"(psk|passphrase|password|passwd|secret|wpa_?key)", re.I)
 
 
 def register_notifier(name: str) -> Callable[[type["Notifier"]], type["Notifier"]]:
@@ -38,6 +42,8 @@ class Notifier(abc.ABC):
     type_name = "base"
     # Human-facing channels are rate limited; record-keeping ones (JSONL) are not.
     rate_limited = True
+    # Option names a configuration may set in alerts.notifiers[].options.
+    CONFIG_OPTIONS: frozenset[str] = frozenset()
 
     def __init__(self, min_severity: Any = "LOW", **options: Any):
         self.min_severity = Severity.parse(min_severity)
@@ -65,5 +71,12 @@ def build_notifiers(configs: list[Any], **context: Any) -> list[Notifier]:
         cls = NOTIFIER_TYPES.get(nc.type)
         if cls is None:
             raise ValueError(f"unknown notifier type {nc.type!r} (available: {', '.join(sorted(NOTIFIER_TYPES))})")
+        for key in nc.options:
+            if _SECRET_LIKE.search(str(key)):
+                raise ValueError(f"alerts.notifiers ({nc.type}): option {key!r} looks like a secret; "
+                                 "daybreak-wids never takes Wi-Fi passphrases or keys in its configuration")
+            if key not in cls.CONFIG_OPTIONS:
+                allowed = ", ".join(sorted(cls.CONFIG_OPTIONS)) or "none"
+                raise ValueError(f"alerts.notifiers ({nc.type}): unknown option {key!r} (allowed: {allowed})")
         out.append(cls(min_severity=nc.min_severity, **{**context.get(nc.type, {}), **nc.options}))
     return out

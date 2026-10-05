@@ -25,6 +25,7 @@ from .config import ConfigError, load_config
 from .fileperm import PRIVATE_UMASK
 from .models import Severity, format_local
 from .safety import CommandRunner, InterfaceGuard, SafetyViolation
+from .sensor.control import sensor_identity_problem
 
 BANNER = ("Authorized defensive monitoring only. daybreak-wids is passive: it never transmits, "
           "injects or deauthenticates.")
@@ -233,6 +234,10 @@ def _sensor_operation(app: App, action: str, apply: bool, channel: int | None) -
     missing = guard.missing_configured()
     problem = (f"protected interface(s) {', '.join(missing)} not found: fix sensor.protected_interfaces "
                "(a misspelled name protects nothing)") if missing else None
+    if problem is None:
+        why = sensor_identity_problem(cfg.sensor, disc.interface(cfg.sensor.interface),
+                                      require_disconnected=action == "prepare")
+        problem = f"{cfg.sensor.interface}: {why}" if why else None
     if not execute:
         click.echo("\nNot executed" + (" (--dry-run)." if app.dry_run else ". Re-run with --apply to execute."))
         try:
@@ -361,15 +366,15 @@ class SensorRecovery:
         self.cfg, self.guard, self.runner = cfg, guard, runner
         self.disabled: str | None = None
 
+    def problem(self, interface: str, found: Any) -> str | None:
+        """Why ``interface`` must not be re-prepared (None: it is the configured, idle sensor)."""
+        why = sensor_identity_problem(self.cfg.sensor, found, require_disconnected=True)
+        if why is None and interface != self.cfg.sensor.interface and not self.cfg.sensor.expected_mac:
+            why = "it is not the configured sensor name, and no sensor.expected_mac identifies the adapter"
+        return why
+
     def is_sensor(self, interface: str, found: Any) -> bool:
-        sc = self.cfg.sensor
-        if found is None:
-            return False
-        if sc.expected_mac and (found.mac or "").upper() != sc.expected_mac.upper():
-            return False
-        if sc.expected_driver and found.driver != sc.expected_driver:
-            return False
-        return interface == sc.interface or bool(sc.expected_mac)
+        return self.problem(interface, found) is None
 
     def __call__(self, interface: str) -> bool:
         from .sensor.control import SensorController
@@ -389,10 +394,9 @@ class SensorRecovery:
             return False
         disc = Discovery(self.runner)
         disc.interfaces()
-        if not self.is_sensor(interface, disc.interface(interface)):
-            click.echo(f"not restoring monitor mode on {interface}: it does not match the configured sensor "
-                       f"({self.cfg.sensor.interface}, MAC {self.cfg.sensor.expected_mac or 'not set'}, "
-                       f"driver {self.cfg.sensor.expected_driver or 'any'})", err=True)
+        why = self.problem(interface, disc.interface(interface))
+        if why:
+            click.echo(f"not restoring monitor mode on {interface}: {why}", err=True)
             return False
         channels = listen_channels(self.cfg)
         ctl = SensorController(interface, self.guard, self.runner, nm_running=disc.nm_running,

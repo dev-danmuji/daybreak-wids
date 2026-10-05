@@ -62,10 +62,26 @@ def test_runner_uses_trusted_paths_and_a_minimal_environment(monkeypatch):
     assert env == {"PATH": safety.TRUSTED_PATH, "LC_ALL": "C", "LANG": "C"}
 
 
-def test_dry_run_is_derived_from_the_command_not_the_caller(monkeypatch):
+def test_dry_run_is_derived_from_the_command_not_the_caller(monkeypatch, tmp_path):
     monkeypatch.setattr(safety.subprocess, "run", lambda *a, **kw: pytest.fail("executed in dry-run"))
-    res = safety.CommandRunner(dry_run=True).run(["iw", "dev", ALFA, "set", "channel", "6"])  # mutating=False
+    fs, route = host_sysfs(tmp_path)
+    guard = InterfaceGuard(["wlo1"], sysfs_root=fs.net, route_file=route, runner=host_runner())
+    runner = safety.CommandRunner(dry_run=True)
+    res = runner.run(["iw", "dev", ALFA, "set", "channel", "6"], guard=guard)  # mutating=False
     assert res.stderr == "dry-run: not executed"
+
+
+def test_interface_changing_commands_need_the_guard_even_in_the_runner(monkeypatch, tmp_path):
+    monkeypatch.setattr(safety.subprocess, "run", lambda *a, **kw: pytest.fail("executed"))
+    fs, route = host_sysfs(tmp_path)
+    guard = InterfaceGuard(["wlo1"], sysfs_root=fs.net, route_file=route, runner=host_runner())
+    runner = safety.CommandRunner(dry_run=True)
+    with pytest.raises(SafetyViolation, match="need the interface guard"):
+        runner.run(["ip", "link", "set", ALFA, "down"])
+    for argv in (["ip", "link", "set", "wlo1", "down"], ["nmcli", "device", "set", "wlo1", "managed", "no"],
+                 ["iw", "dev", "wlo1", "set", "type", "monitor"]):
+        with pytest.raises(SafetyViolation, match="protected"):
+            runner.run(argv, guard=guard)
 
 
 def test_runner_history_is_bounded(monkeypatch):
@@ -496,3 +512,98 @@ def test_station_tracker_is_bounded():
                               station=f"10:00:00:00:{i >> 8:02X}:{i & 255:02X}"))
     assert len(tracker.seen["AA:BB:CC:DD:EE:FF"]) <= tracker.MAX_PER_BSSID
     assert "10:00:00:00:0B:B7" in tracker.seen["AA:BB:CC:DD:EE:FF"]  # the most recent station is kept
+
+
+# -- transmit-path review: sensor identity, Kismet paths, frame tap, desktop -------------------------------
+
+def test_prepare_refuses_a_connected_or_unexpected_sensor(tmp_path):
+    from daybreak.sensor.control import sensor_identity_problem
+
+    cfg = make_config(tmp_path, sensor={"interface": ALFA, "expected_mac": ALFA_MAC}).sensor
+    idle = NS(mac=ALFA_MAC.lower(), driver="mt7921u", nm_state="disconnected", iftype="managed", ssid=None)
+    assert sensor_identity_problem(cfg, idle, require_disconnected=True) is None
+    connected = NS(**{**idle.__dict__, "nm_state": "connected"})
+    assert "connected" in sensor_identity_problem(cfg, connected, require_disconnected=True)
+    assert sensor_identity_problem(cfg, connected, require_disconnected=False) is None  # release is fine
+    associated = NS(**{**idle.__dict__, "ssid": "SomeNetwork"})
+    assert "associated" in sensor_identity_problem(cfg, associated, require_disconnected=True)
+    internal = NS(mac="02:00:00:00:00:01", driver="iwlwifi", nm_state="disconnected", iftype="managed", ssid=None)
+    assert "MAC" in sensor_identity_problem(cfg, internal, require_disconnected=False)
+    no_mac = make_config(tmp_path, sensor={"interface": "wlo2"}).sensor   # expected_driver stays mt7921u
+    assert "driver" in sensor_identity_problem(no_mac, internal, require_disconnected=False)
+
+
+def test_cli_prepare_refuses_a_connected_sensor(tmp_path, monkeypatch):
+    import yaml
+    from click.testing import CliRunner
+
+    import daybreak.sensor.discovery as discovery
+
+    fs, route = host_sysfs(tmp_path)
+    runners = []
+
+    def runner_factory(dry_run=False, timeout=10.0):
+        r = host_runner(dry_run=dry_run)
+        r.responses[("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status")] = (
+            "wlo1:wifi:connected\nwlx00c0cab85c32:wifi:connected\n")
+        runners.append(r)
+        return r
+
+    monkeypatch.setattr(cli, "CommandRunner", runner_factory)
+    monkeypatch.setattr(cli, "InterfaceGuard", lambda *a, **kw: InterfaceGuard(*a, sysfs_root=fs.net,
+                                                                               route_file=route, **kw))
+    original = discovery.Discovery
+
+    class FakeDiscovery(original):
+        def __init__(self, runner=None, **kw):
+            super().__init__(runner, sysfs_root=fs.net, route_file=route)
+
+    monkeypatch.setattr(discovery, "Discovery", FakeDiscovery)
+    monkeypatch.setattr(discovery, "capability_effective", lambda *a, **kw: {"CAP_NET_ADMIN", "CAP_NET_RAW"})
+    path = tmp_path / "c.yaml"
+    path.write_text(yaml.safe_dump({"protected_networks": []}))
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "sensor", "prepare", "--apply", "--channel", "36"])
+    assert r.exit_code == 1 and "connected to a network" in r.output
+    assert all(not rr.executed for rr in runners)
+
+
+@pytest.mark.parametrize("path", [
+    "/system/status.json/../../datasource/by-uuid/x/set_channel.cmd",
+    "/alerts/wrapped/last-time/1.000000/../../../datasource/add_source.cmd",
+    "/system/status.json?KISMET=x", "/devices/last-time/1/devices.json", "/logging/active.json#frag",
+    "/datasource/all_sources.json%2f..",
+])
+def test_kismet_paths_must_match_an_endpoint_exactly(path):
+    from daybreak.sensor.kismet import KismetClient, KismetError
+
+    with pytest.raises(KismetError, match="not allow-listed"):
+        KismetClient("http://127.0.0.1:9", timeout=0.1).request(path)
+
+
+def test_frame_tap_refuses_malformed_or_protected_interface_names(tmp_path):
+    from daybreak.sensor.backend import BackendUnavailable
+
+    fs, route = host_sysfs(tmp_path)
+    runner = host_runner()
+    guard = InterfaceGuard(["wlo1"], sysfs_root=fs.net, route_file=route, runner=runner)
+    with FakeKismet() as fk:
+        import kismet_fake
+
+        cfg = make_config(tmp_path, backend={"type": "kismet", "kismet": {"url": fk.url, "timeout": 2}})
+        os.environ["DAYBREAK_TEST_TAP_KEY"] = kismet_fake.API_KEY
+        try:
+            cfg.backend.kismet.api_key_env = "DAYBREAK_TEST_TAP_KEY"
+            backend = choose_backend(cfg, guard=guard, runner=runner, log=lambda m: None)
+        finally:
+            del os.environ["DAYBREAK_TEST_TAP_KEY"]
+    for name in ("wlo1", "../wlo1", "-x"):
+        with pytest.raises(BackendUnavailable, match="refusing a frame tap"):
+            backend.frame_tap_factory(name)
+
+
+def test_desktop_notifications_are_disabled_as_root(monkeypatch):
+    from daybreak.alerts import desktop
+
+    monkeypatch.setattr(desktop.os, "geteuid", lambda: 0)
+    available, why = desktop.desktop_available()
+    assert not available and "root" in why

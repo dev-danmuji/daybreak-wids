@@ -135,7 +135,7 @@ def test_no_management_frame_templates():
 
 # Single source of truth: the runtime allow-list enforced by CommandRunner, plus notify-send
 # (run by the desktop notifier, fixed arguments).
-ALLOWED_HOST_COMMANDS = [pattern for pattern, _mutating in COMMAND_ALLOW_LIST] + [("notify-send", None)]
+ALLOWED_HOST_COMMANDS = [entry.pattern for entry in COMMAND_ALLOW_LIST] + [("notify-send", None)]
 
 
 def _literal_argv(node: ast.List) -> list[object] | None:

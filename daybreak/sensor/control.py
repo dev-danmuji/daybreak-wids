@@ -8,8 +8,34 @@ change. Commands only ever target the configured sensor interface.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from ..safety import CommandResult, CommandRunner, InterfaceGuard, SafetyViolation
+
+
+def sensor_identity_problem(sensor_cfg: Any, found: Any, *, require_disconnected: bool) -> str | None:
+    """Why the interface ``found`` (a discovered interface) must not be changed as the sensor.
+
+    It must carry the configured MAC and driver, and before monitor mode is enabled it must not
+    be connected: taking a connected interface down makes it send its own deauthentication, and
+    a connected interface may be a link the operator relies on.
+    """
+    if found is None:
+        return "interface not found"
+    mac = (getattr(found, "mac", None) or "").upper()
+    if sensor_cfg.expected_mac and mac != sensor_cfg.expected_mac.upper():
+        return f"MAC {mac or '?'} is not the configured sensor adapter ({sensor_cfg.expected_mac.upper()})"
+    driver = getattr(found, "driver", None)
+    if sensor_cfg.expected_driver and driver != sensor_cfg.expected_driver:
+        return f"driver {driver or '?'} is not the expected sensor driver ({sensor_cfg.expected_driver})"
+    if require_disconnected:
+        state = getattr(found, "nm_state", None) or ""
+        if state.startswith("connect"):
+            return (f"it is connected to a network (NetworkManager: {state}); disconnect it yourself first - "
+                    "daybreak-wids does not take down a connected interface")
+        if getattr(found, "iftype", None) == "managed" and getattr(found, "ssid", None):
+            return "it is associated with a network; disconnect it yourself first"
+    return None
 
 
 @dataclass
@@ -97,7 +123,7 @@ class SensorController:
             except SafetyViolation as exc:
                 report.error = str(exc)
                 break
-            res = self.runner.run(argv, mutating=True)
+            res = self.runner.run(argv, mutating=True, guard=self.guard)
             report.results.append(res)
             if not res.ok:
                 report.error = f"{' '.join(argv)} failed: {res.stderr.strip() or res.returncode}"
@@ -115,4 +141,4 @@ class SensorController:
     def set_channel(self, channel: int) -> CommandResult:
         self._check_target()
         return self.runner.run(["iw", "dev", self.interface, "set", "channel", str(int(channel))],
-                               mutating=True)
+                               mutating=True, guard=self.guard)

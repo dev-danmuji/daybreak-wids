@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Callable
 
 from ..config import Config
-from ..safety import CommandRunner, InterfaceGuard
-from .backend import Backend
+from ..safety import CommandRunner, InterfaceGuard, valid_ifname
+from .backend import Backend, BackendUnavailable
 from .control import SensorController
 from .kismet import KismetAuthError, KismetBackend, KismetClient, KismetError
 from .passive import PassiveBackend
@@ -76,6 +76,10 @@ def choose_backend(config: Config, kind: str | None = None, *, replay: str | Pat
                 log(f"Kismet unavailable ({exc}); using the built-in passive backend")
         if reachable or kind == "kismet":
             def tap(iface: str) -> Backend:
+                # The name comes from Kismet's datasource list: receive-only, but still never a
+                # malformed or protected interface.
+                if not valid_ifname(iface) or iface in guard.protected_set():
+                    raise BackendUnavailable(f"refusing a frame tap on {iface!r}: not a valid sensor interface")
                 return PassiveBackend(iface, sensor_name=config.sensor.interface)  # Kismet owns channels
             return KismetBackend(config.backend.kismet, sensor_interface=config.sensor.interface,
                                  client=client, frame_tap_factory=tap)

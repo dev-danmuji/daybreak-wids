@@ -1,9 +1,9 @@
 """Built-in passive capture backend (fallback when Kismet is unavailable).
 
-Opens a *receive-only* ``AF_PACKET`` socket on a monitor-mode sensor
-interface and converts frames to metadata events. The socket is wrapped in
-:class:`ReceiveOnlySocket`, which exposes no transmit operation at all; the
-package's static safety tests forbid send/write calls in this module.
+Opens an ``AF_PACKET`` socket on a monitor-mode sensor interface, only ever
+reads from it, and converts frames to metadata events. The socket is wrapped in
+:class:`ReceiveOnlySocket`, whose interface offers receive operations only; no
+code in the package writes to it (tests/test_safety.py checks the common forms).
 Requires CAP_NET_RAW (run as root; do not give file capabilities to a shared Python interpreter).
 """
 
@@ -28,7 +28,8 @@ _GONE = {errno.ENETDOWN, errno.ENXIO, errno.ENODEV, errno.EBADF}
 
 
 class ReceiveOnlySocket:
-    """Minimal wrapper: receive, fileno and close. Nothing else is reachable."""
+    """Minimal wrapper offering receive, fileno and close only (a convention the package keeps,
+    not a sandbox: nothing outside this module touches the underlying socket)."""
 
     __slots__ = ("_sock",)
 

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 
 import pytest
 
@@ -11,6 +12,7 @@ from daybreak.alerts.jsonl import JsonlNotifier, rotating_logger
 from daybreak.alerts.manager import AlertManager, TokenBucket
 from daybreak.config import NotifierConfig
 from daybreak.models import Alert, ScoreComponent, Severity
+from daybreak.safety import TRUSTED_PATH
 from daybreak.storage import Database
 
 T0 = 1790000000.0
@@ -151,11 +153,13 @@ def test_human_log_rotation(tmp_path):
 
 def test_desktop_notifier_uses_notify_send():
     calls = []
-    d = DesktopNotifier(min_severity="HIGH", run=lambda argv, **kw: calls.append(argv), available=True)
+    d = DesktopNotifier(min_severity="HIGH", run=lambda argv, **kw: calls.append((argv, kw)), available=True)
     a = alert(0, score=95, kind="POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT")
     d.notify(a)
-    assert calls[0][0] == "notify-send" and "--urgency=critical" in calls[0]
-    assert "CRITICAL POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT" in calls[0][3]
+    argv, kw = calls[0]
+    assert os.path.basename(argv[0]) == "notify-send" and "--urgency=critical" in argv
+    assert "CRITICAL POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT" in argv[3]
+    assert kw["env"]["PATH"] == TRUSTED_PATH and not {"KISMET_API_KEY", "KISMET_PASSWORD"} & set(kw["env"])
     off = DesktopNotifier(run=lambda *a, **k: pytest.fail("must not run"), available=False)
     off.notify(a)
 
@@ -163,6 +167,8 @@ def test_desktop_notifier_uses_notify_send():
 def test_notifier_registry_is_extensible(tmp_path):
     @register_notifier("unit-webhook")
     class Hook(Notifier):
+        CONFIG_OPTIONS = frozenset({"url"})
+
         def __init__(self, min_severity="HIGH", url="", **options):
             super().__init__(min_severity, **options)
             self.url = url
@@ -177,6 +183,10 @@ def test_notifier_registry_is_extensible(tmp_path):
                                 jsonl={"path": tmp_path / "x.jsonl"})
         assert isinstance(built[0], Hook) and built[0].url.endswith("/hook")
         assert built[0].min_severity is Severity.MEDIUM and isinstance(built[1], JsonlNotifier)
+        with pytest.raises(ValueError, match="unknown option 'colour'"):
+            build_notifiers([NotifierConfig(type="console", options={"colour": True})])
+        with pytest.raises(ValueError, match="looks like a secret"):
+            build_notifiers([NotifierConfig(type="unit-webhook", options={"wifi_psk": "x"})])
         with pytest.raises(ValueError, match="unknown notifier"):
             build_notifiers([NotifierConfig(type="carrier-pigeon")])
     finally:

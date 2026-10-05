@@ -18,6 +18,7 @@ _RESET = "\033[0m"
 
 @register_notifier("console")
 class ConsoleNotifier(Notifier):
+    CONFIG_OPTIONS = frozenset({"color"})
     def __init__(self, min_severity: Any = "LOW", stream: TextIO | None = None, color: bool | None = None,
                  **options: Any):
         super().__init__(min_severity, **options)

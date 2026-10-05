@@ -21,7 +21,7 @@ import subprocess
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Sequence
 
 
 class SafetyViolation(RuntimeError):
@@ -63,31 +63,36 @@ def valid_ifname(name: Any) -> bool:
     return isinstance(name, str) and name not in (".", "..") and _IFNAME.fullmatch(name) is not None
 
 
-# The only host commands daybreak-wids runs, as (pattern, mutating). ``None`` is a variable
-# argument (interface / PHY name or channel number), a set is a choice. Checked at runtime by
-# CommandRunner and statically over the source by tests/test_safety.py.
-COMMAND_ALLOW_LIST: tuple[tuple[tuple[Any, ...], bool], ...] = (
-    (("iw", "phy", None, "info"), False),
-    (("iw", "dev", None, "info"), False),
-    (("iw", "reg", "get"), False),
-    (("iw", "dev", None, "set", "type", frozenset({"monitor", "managed"})), True),
-    (("iw", "dev", None, "set", "channel", None), True),
-    (("ip", "link", "set", None, frozenset({"up", "down"})), True),
-    (("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"), False),
-    (("nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"), False),
-    (("nmcli", "device", "set", None, "managed", frozenset({"yes", "no"})), True),
+class AllowedCommand(NamedTuple):
+    pattern: tuple[Any, ...]   # None: a variable argument (interface / PHY name, channel); a set: a choice
+    mutating: bool
+    iface: int | None = None   # for interface-changing commands: index of the interface argument
+
+
+# The only host commands daybreak-wids runs. Checked at runtime by CommandRunner (interface-changing
+# ones also pass the interface guard there) and statically over the source by tests/test_safety.py.
+COMMAND_ALLOW_LIST: tuple[AllowedCommand, ...] = (
+    AllowedCommand(("iw", "phy", None, "info"), False),
+    AllowedCommand(("iw", "dev", None, "info"), False),
+    AllowedCommand(("iw", "reg", "get"), False),
+    AllowedCommand(("iw", "dev", None, "set", "type", frozenset({"monitor", "managed"})), True, 2),
+    AllowedCommand(("iw", "dev", None, "set", "channel", None), True, 2),
+    AllowedCommand(("ip", "link", "set", None, frozenset({"up", "down"})), True, 3),
+    AllowedCommand(("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"), False),
+    AllowedCommand(("nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"), False),
+    AllowedCommand(("nmcli", "device", "set", None, "managed", frozenset({"yes", "no"})), True, 3),
 )
 
 # Tools are resolved here only, never through the caller's PATH (sudo -E, an activated venv).
 TRUSTED_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 
 
-def command_changes_state(argv: Sequence[str]) -> bool | None:
-    """``True``/``False`` (mutating or not) for an allow-listed command, ``None`` otherwise."""
-    for pattern, mutating in COMMAND_ALLOW_LIST:
-        if len(argv) != len(pattern):
+def match_command(argv: Sequence[str]) -> AllowedCommand | None:
+    """The allow-list entry ``argv`` matches, or ``None``."""
+    for entry in COMMAND_ALLOW_LIST:
+        if len(argv) != len(entry.pattern):
             continue
-        for got, want in zip(argv, pattern):
+        for got, want in zip(argv, entry.pattern):
             if want is None:
                 if not valid_ifname(got):  # names and channel numbers alike; never an option
                     break
@@ -97,7 +102,7 @@ def command_changes_state(argv: Sequence[str]) -> bool | None:
             elif got != want:
                 break
         else:
-            return mutating
+            return entry
     return None
 
 
@@ -125,12 +130,21 @@ class CommandResult:
         return self.returncode == 0
 
 
-def checked_command(argv: Sequence[str], mutating: bool = False) -> bool:
-    """Raise unless ``argv`` is allow-listed; return whether it mutates (never caller-declared only)."""
-    derived = command_changes_state(argv)
-    if derived is None:
+def checked_command(argv: Sequence[str], mutating: bool = False, guard: "InterfaceGuard | None" = None) -> bool:
+    """Raise unless ``argv`` is allow-listed; return whether it changes state.
+
+    Whether it changes state comes from the allow-list, not only from the caller, and an
+    interface-changing command is refused unless the interface guard approves its interface.
+    """
+    entry = match_command(argv)
+    if entry is None:
         raise SafetyViolation(f"command is not allow-listed: {list(argv)}")
-    return mutating or derived
+    if mutating or entry.mutating:
+        if guard is None:
+            raise SafetyViolation(f"refusing {' '.join(argv)}: interface-changing commands need the interface guard")
+        guard.assert_may_modify(argv[entry.iface])
+        return True
+    return False
 
 
 class CommandRunner:
@@ -141,9 +155,10 @@ class CommandRunner:
         self.timeout = timeout
         self.history: deque[list[str]] = deque(maxlen=200)  # recent commands, bounded
 
-    def run(self, argv: Sequence[str], *, mutating: bool = False) -> CommandResult:
+    def run(self, argv: Sequence[str], *, mutating: bool = False,
+            guard: "InterfaceGuard | None" = None) -> CommandResult:
         argv = list(argv)
-        mutating = checked_command(argv, mutating)
+        mutating = checked_command(argv, mutating, guard)
         self.history.append(argv)
         if mutating and self.dry_run:
             return CommandResult(argv, 0, "", "dry-run: not executed")

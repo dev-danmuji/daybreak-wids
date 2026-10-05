@@ -7,14 +7,13 @@ import glob
 import json
 import logging
 import os
-import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 from .detectors.base import SENSOR_LOST, SENSOR_RECOVERED
-from .fileperm import private_dir, secure_path
+from .fileperm import write_private_atomic
 from .models import iso_utc
 from .pipeline import protected_alert, sensor_alert
 from .runtime import Runtime
@@ -171,19 +170,8 @@ class MonitorRunner:
     def _write_status(self, state: str) -> None:
         if not self.write_status:
             return
-        path = status_path(self.rt)
-        private_dir(path.parent)
-        # mkstemp (O_CREAT|O_EXCL) never follows a planted symlink; rename replaces the link itself.
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".monitor.status.", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(self._status_doc(state), fh, indent=2, default=str)
-            secure_path(tmp)
-            os.replace(tmp, path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
+        # mkstemp + rename: a planted symlink cannot redirect the write (see fileperm)
+        write_private_atomic(status_path(self.rt), json.dumps(self._status_doc(state), indent=2, default=str))
 
     # -- sensor health ---------------------------------------------------------------
     def _transition(self, t: HealthTransition, reason: str | None = None) -> None:
