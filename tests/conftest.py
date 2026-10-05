@@ -19,7 +19,8 @@ ROGUE_BSSID = "02:13:37:00:00:01"
 
 @pytest.fixture(autouse=True)
 def _no_rf_or_network(monkeypatch):
-    """Tests never transmit: block raw/packet sockets and outbound connections."""
+    """Refuse AF_PACKET sockets at construction and subprocess.run calls to host network tools
+    (loopback TCP to the fake Kismet servers stays allowed)."""
     real_socket = socket.socket
 
     class GuardedSocket(real_socket):

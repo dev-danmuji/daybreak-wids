@@ -16,9 +16,10 @@ from ..safety import CommandResult, CommandRunner, InterfaceGuard, SafetyViolati
 def sensor_identity_problem(sensor_cfg: Any, found: Any, *, require_disconnected: bool) -> str | None:
     """Why the interface ``found`` (a discovered interface) must not be changed as the sensor.
 
-    It must carry the configured MAC and driver, and before monitor mode is enabled it must not
-    be connected: taking a connected interface down makes it send its own deauthentication, and
-    a connected interface may be a link the operator relies on.
+    It must carry the configured MAC and driver, and with ``require_disconnected`` (prepare and
+    release) it must not be in use: taking a connected interface down makes it send its own
+    deauthentication, and a connected interface, an access point or a mesh node may be a link
+    the operator relies on.
     """
     if found is None:
         return "interface not found"
@@ -33,8 +34,12 @@ def sensor_identity_problem(sensor_cfg: Any, found: Any, *, require_disconnected
         if state.startswith("connect"):
             return (f"it is connected to a network (NetworkManager: {state}); disconnect it yourself first - "
                     "daybreak-wids does not take down a connected interface")
-        if getattr(found, "iftype", None) == "managed" and getattr(found, "ssid", None):
+        iftype = getattr(found, "iftype", None)
+        if iftype == "managed" and getattr(found, "ssid", None):
             return "it is associated with a network; disconnect it yourself first"
+        if iftype not in (None, "managed", "monitor"):
+            return (f"it is in {iftype} mode (an access point, ad-hoc or mesh link?); stop that yourself "
+                    "first - daybreak-wids only switches between managed and monitor mode")
     return None
 
 

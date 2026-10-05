@@ -493,10 +493,32 @@ def normalize_allowed_host(host: Any) -> str:
     return name
 
 
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_KEY_LIKE = re.compile(r"[0-9A-Fa-f]{16,}")
+
+
 def _validate(cfg: Config) -> None:
     enforce_passive(cfg.safety)
     if not cfg.sensor.interface:
         raise ConfigError("sensor.interface must be set")
+    if not cfg.sensor.protected_interfaces:
+        raise ConfigError("sensor.protected_interfaces must not be empty: list the interface(s) your "
+                          "connection uses (default: wlo1)")
+    for key in ("api_key_env", "password_env"):  # names of variables, never the secret itself
+        value = getattr(cfg.backend.kismet, key)
+        if not isinstance(value, str) or not _ENV_NAME.fullmatch(value) or _KEY_LIKE.fullmatch(value):
+            raise ConfigError(f"backend.kismet.{key} must be the name of an environment variable "
+                              "(e.g. KISMET_API_KEY), not the secret itself")
+    for key in ("human_log", "jsonl_log"):
+        name = getattr(cfg.logging, key)
+        if not name or name in (".", "..") or "/" in name or "\x00" in name:
+            raise ConfigError(f"logging.{key} must be a file name inside logging.directory")
+    from .alerts.base import secret_like_options
+    for i, n in enumerate(cfg.alerts.notifiers):
+        secret = secret_like_options(n.options)
+        if secret:
+            raise ConfigError(f"alerts.notifiers[{i}]: option {secret[0]!r} looks like a secret; daybreak-wids "
+                              "never takes Wi-Fi passphrases or keys in its configuration")
     names = [("sensor.interface", cfg.sensor.interface), ("backend.passive.interface", cfg.backend.passive.interface)]
     names += [(f"sensor.protected_interfaces[{i}]", n) for i, n in enumerate(cfg.sensor.protected_interfaces)]
     for where, name in names:
@@ -531,15 +553,18 @@ def _validate(cfg: Config) -> None:
                           ("detection.baseline", cfg.detection.baseline)):
         for f in dataclasses.fields(section):
             value = getattr(section, f.name)
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value <= 0:
-                raise ConfigError(f"{name}.{f.name} must be positive")
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and \
+                    (not math.isfinite(value) or value <= 0):
+                raise ConfigError(f"{name}.{f.name} must be positive (a finite number)")
+    if cfg.detection.baseline.bucket < 10:
+        raise ConfigError("detection.baseline.bucket must be at least 10 seconds")
     for i, n in enumerate(cfg.alerts.notifiers):
         try:
             n.min_severity = Severity.parse(n.min_severity).name
         except ValueError as exc:
             raise ConfigError(f"alerts.notifiers[{i}].min_severity: {exc}") from exc
-    if cfg.alerts.cooldown < 0:
-        raise ConfigError("alerts.cooldown must be >= 0")
+    if not math.isfinite(cfg.alerts.cooldown) or cfg.alerts.cooldown < 0:
+        raise ConfigError("alerts.cooldown must be a number >= 0")
     for key, value in cfg.scoring.weights.items():
         if key not in DEFAULT_WEIGHTS:
             raise ConfigError(f"unknown scoring weight: {key} (known: {', '.join(sorted(DEFAULT_WEIGHTS))})")

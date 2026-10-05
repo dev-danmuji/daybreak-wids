@@ -7,9 +7,10 @@ import re
 from ..models import Alert, format_local
 from ..scoring import explain
 
-# C0/C1 control characters and Unicode bidi overrides: an attacker-chosen SSID or a relayed
-# Kismet alert text must not move the cursor, forge log lines or reorder what is shown.
-_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# C0/C1 controls, Unicode line/paragraph separators, bidi controls and invisible characters: an
+# attacker-chosen SSID or a relayed Kismet alert text must not move the cursor, forge log lines,
+# reorder what is shown or hide text.
+_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
 
 
 def printable(text: object) -> str:

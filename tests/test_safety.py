@@ -1,7 +1,9 @@
-"""Static guarantees: the package contains no transmit, injection, cracking or
-password-guessing capability, and only runs an allow-listed set of host commands.
+"""Static checks: no transmit, injection, cracking or password-guessing code, and
+host commands only from the allow-list.
 
-These tests inspect the source (AST) of every module under ``daybreak/``.
+These tests inspect the source (AST) of every module under ``daybreak/`` for
+literal forms of those operations. They are a tripwire for code review, not a
+sandbox: ordinary code written differently can pass them.
 """
 
 from __future__ import annotations

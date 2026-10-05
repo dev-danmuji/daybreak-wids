@@ -3,7 +3,7 @@
 Opens an ``AF_PACKET`` socket on a monitor-mode sensor interface, only ever
 reads from it, and converts frames to metadata events. The socket is wrapped in
 :class:`ReceiveOnlySocket`, whose interface offers receive operations only; no
-code in the package writes to it (tests/test_safety.py checks the common forms).
+code in the package writes to it (tests/test_safety.py checks some literal forms).
 Requires CAP_NET_RAW (run as root; do not give file capabilities to a shared Python interpreter).
 """
 

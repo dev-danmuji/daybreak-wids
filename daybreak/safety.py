@@ -1,8 +1,9 @@
 """Passive-only safety model.
 
-daybreak-wids never transmits. There is no injection, deauthentication,
-handshake capture/export, cracking or password-guessing code anywhere in this
-package; ``tests/test_safety.py`` enforces that statically.
+daybreak-wids never constructs or sends 802.11 frames. There is no injection,
+deauthentication, handshake capture/export, cracking or password-guessing code
+in this package; ``tests/test_safety.py`` checks some literal forms of these
+statically (a tripwire for code review, not a sandbox).
 
 This module covers the remaining risk: changing the *wrong* network interface.
 Only the dedicated sensor interface may ever be reconfigured (monitor mode,
@@ -144,6 +145,8 @@ def checked_command(argv: Sequence[str], mutating: bool = False, guard: "Interfa
     if entry is None:
         raise SafetyViolation(f"command is not allow-listed: {list(argv)}")
     if mutating or entry.mutating:
+        if entry.iface is None:
+            raise SafetyViolation(f"refusing {' '.join(argv)}: not an interface-changing command")
         if guard is None:
             raise SafetyViolation(f"refusing {' '.join(argv)}: interface-changing commands need the interface guard")
         guard.assert_may_modify(argv[entry.iface])

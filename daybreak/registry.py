@@ -11,7 +11,11 @@ from .config import (
 )
 from .models import AP_OBSERVATION_TYPES, Event, EventType
 
-_QUOTED = re.compile(r"'([^']{1,32})'|\"([^\"]{1,32})\"")
+
+def _quoted_ssid(ssid: str) -> re.Pattern[str]:
+    """The SSID exactly, in single or double quotes, as a whole token of a Kismet alert text."""
+    body = re.escape(ssid)
+    return re.compile(r"(?<![^\s(\[])(?:'" + body + r"'|\"" + body + r"\")(?=[\s,.;:)\]]|$)")
 
 
 class NetworkRegistry:
@@ -24,6 +28,7 @@ class NetworkRegistry:
             for b in net.bssids:
                 self._by_bssid.setdefault(b, net)
             self._by_ssid.setdefault(net.ssid, []).append(net)
+        self._quoted = [(net, _quoted_ssid(net.ssid)) for net in self.networks if net.ssid]
 
     def by_name(self, name: str) -> ProtectedNetwork | None:
         return next((n for n in self.networks if n.name == name), None)
@@ -57,11 +62,12 @@ class NetworkRegistry:
                 net = self.by_bssid(mac)
                 if net:
                     return net
-            # Kismet quotes SSIDs in its alert texts ('...' or "..."): compare for equality, never
-            # as a substring (a neighbour 'myhome-5G' is not the protected network 'home').
-            quoted = {a or b for a, b in _QUOTED.findall(str(event.metadata.get("kismet_text", "")))}
-            for net in self.networks:
-                if net.ssid and net.ssid in quoted:
+            # Kismet quotes SSIDs in its alert texts ('...' or "..."): match the whole quoted SSID,
+            # never a substring (a neighbour 'myhome-5G' is not the protected network 'home'),
+            # and SSIDs that contain quotes themselves ('Bob's WiFi') still match.
+            text = str(event.metadata.get("kismet_text", ""))
+            for net, pattern in self._quoted:
+                if pattern.search(text):
                     return net
         return None
 

@@ -95,12 +95,15 @@ def _check_sensor(cfg: Config, iface: WirelessInterface, guard: InterfaceGuard,
         if iface.driver == expected:
             report.add("driver", OK, f"driver {iface.driver}")
         else:
-            report.add("driver", WARN, f"driver {iface.driver or 'unknown'} (expected {expected})")
+            report.add("driver", WARN, f"driver {iface.driver or 'unknown'} (expected {expected})",
+                       "`sensor prepare` refuses this adapter until sensor.expected_driver matches "
+                       "(see `sensor list`)")
     if cfg.sensor.expected_mac:
         if iface.mac == cfg.sensor.expected_mac:
             report.add("mac", OK, f"MAC {iface.mac}")
         else:
-            report.add("mac", WARN, f"MAC {iface.mac} differs from sensor.expected_mac {cfg.sensor.expected_mac}")
+            report.add("mac", WARN, f"MAC {iface.mac} differs from sensor.expected_mac {cfg.sensor.expected_mac}",
+                       "`sensor prepare` refuses this adapter: it is not the configured sensor")
 
     try:
         guard.assert_may_modify(iface.name)

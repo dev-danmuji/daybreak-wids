@@ -62,6 +62,11 @@ class Notifier(abc.ABC):
         pass
 
 
+def secret_like_options(options: Any) -> list[str]:
+    """Notifier option names that look like a passphrase or key (checked at config load too)."""
+    return [str(k) for k in (options or {}) if _SECRET_LIKE.search(str(k))]
+
+
 def build_notifiers(configs: list[Any], **context: Any) -> list[Notifier]:
     """Instantiate notifiers from ``alerts.notifiers`` config entries."""
     from . import console, desktop, jsonl  # noqa: F401  (registration side effects)
@@ -72,7 +77,7 @@ def build_notifiers(configs: list[Any], **context: Any) -> list[Notifier]:
         if cls is None:
             raise ValueError(f"unknown notifier type {nc.type!r} (available: {', '.join(sorted(NOTIFIER_TYPES))})")
         for key in nc.options:
-            if _SECRET_LIKE.search(str(key)):
+            if secret_like_options({key: None}):
                 raise ValueError(f"alerts.notifiers ({nc.type}): option {key!r} looks like a secret; "
                                  "daybreak-wids never takes Wi-Fi passphrases or keys in its configuration")
             if key not in cls.CONFIG_OPTIONS:

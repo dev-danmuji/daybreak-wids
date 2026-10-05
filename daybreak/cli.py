@@ -23,12 +23,12 @@ from . import __version__
 from .alerts.formatting import printable
 from .config import ConfigError, load_config
 from .fileperm import PRIVATE_UMASK
-from .models import Severity, format_local
+from .models import Severity, clean_text, format_local
 from .safety import CommandRunner, InterfaceGuard, SafetyViolation
 from .sensor.control import sensor_identity_problem
 
-BANNER = ("Authorized defensive monitoring only. daybreak-wids is passive: it never transmits, "
-          "injects or deauthenticates.")
+BANNER = ("Authorized defensive monitoring only. daybreak-wids is passive: it never constructs, "
+          "injects or sends 802.11 frames.")
 
 
 class App:
@@ -79,7 +79,7 @@ def handle_errors(func: Callable) -> Callable:
 
 
 def emit_json(data: Any) -> None:
-    click.echo(json.dumps(data, indent=2, default=str, ensure_ascii=False))
+    click.echo(clean_text(json.dumps(data, indent=2, default=str, ensure_ascii=False)))
 
 
 def parse_since(text: str | None, default: float | None = 86400.0) -> float | None:
@@ -204,11 +204,11 @@ def sensor_check(app: App) -> None:
             click.echo(f"NM        : {s.nm_state or 'n/a'}")
         click.echo("")
         for c in report.checks:
-            click.echo(f"[{LEVEL_MARK[c.level]}] {c.name}: {c.message}")
+            click.echo(f"[{LEVEL_MARK[c.level]}] {c.name}: {printable(c.message)}")
             if c.hint and c.level in ("warn", "fail", "info"):
-                click.echo(f"         hint: {c.hint}")
+                click.echo(f"         hint: {printable(c.hint)}")
         for level, name, msg in kismet or []:
-            click.echo(f"[{LEVEL_MARK.get(level, level)}] kismet-{name}: {msg}")
+            click.echo(f"[{LEVEL_MARK.get(level, level)}] kismet-{printable(name)}: {printable(msg)}")
     if not report.ok:
         sys.exit(1)
 
@@ -241,8 +241,7 @@ def _sensor_operation(app: App, action: str, apply: bool, channel: int | None) -
         else:  # handing the sensor back must stay possible
             click.echo(f"warning: {msg}", err=True)
     if problem is None:
-        why = sensor_identity_problem(cfg.sensor, disc.interface(cfg.sensor.interface),
-                                      require_disconnected=action == "prepare")
+        why = sensor_identity_problem(cfg.sensor, disc.interface(cfg.sensor.interface), require_disconnected=True)
         problem = f"{cfg.sensor.interface}: {why}" if why else None
     if not execute:
         click.echo("\nNot executed" + (" (--dry-run)." if app.dry_run else ". Re-run with --apply to execute."))
@@ -316,8 +315,8 @@ def kismet_check(app: App) -> None:
     if app.json_out:
         emit_json([{"level": l, "name": n, "message": m} for l, n, m in results])
     else:
-        for level, name, msg in results:
-            click.echo(f"[{LEVEL_MARK.get(level, level)}] {name}: {msg}")
+        for level, name, msg in results:  # names and texts can come from Kismet
+            click.echo(f"[{LEVEL_MARK.get(level, level)}] {printable(name)}: {printable(msg)}")
     if any(level == "fail" for level, _, _ in results):
         sys.exit(1)
 
@@ -444,6 +443,9 @@ def _run_monitor(app: App, backend, health, recover, duration: float | None, qui
 
     stream = _NullStream() if quiet else None
     rt = build_runtime(app.config, dry_run=app.dry_run, console_stream=stream)
+    for n in rt.alerts.notifiers:
+        if getattr(n, "disabled_reason", None):
+            click.echo(f"{n.type_name} notifications off: {n.disabled_reason}", err=True)
     for ob in observers or []:
         rt.pipeline.observers.append(ob)
     stop = threading.Event()
@@ -467,6 +469,12 @@ def _run_monitor(app: App, backend, health, recover, duration: float | None, qui
     if before is not None:
         changes = guard.verify_unchanged(before, guard.snapshot_protected())
         summary["protected_interfaces_changed"] = changes
+    input_error = getattr(backend, "input_error", None)
+    if input_error:  # a capture file that is corrupt from some point on: what was before it counts
+        if not backend.stats.get("frames"):
+            raise click.ClickException(f"{backend.name}: {input_error}")
+        click.echo(f"WARNING: {backend.name} input ended early ({input_error}); "
+                   f"{backend.stats['frames']} frames before that were analysed", err=True)
     return rt, summary
 
 
@@ -531,11 +539,11 @@ def monitor_status(app: App) -> None:
         state = "running" if st.get("alive") else ("stopped" if st.get("state") == "stopped" else "not running (stale)")
         click.echo(f"monitor   : {state} (pid {st.get('pid')}), updated {format_local(st['updated'])}")
         b = st.get("backend") or {}
-        click.echo(f"backend   : {b.get('name')} - {b.get('detail', '')}"
-                   + (f" [error: {st['backend_error']}]" if st.get("backend_error") else ""))
+        click.echo(printable(f"backend   : {b.get('name')} - {b.get('detail', '')}"
+                             + (f" [error: {st['backend_error']}]" if st.get("backend_error") else "")))
         s = st.get("sensor") or {}
         online = {True: "ONLINE", False: "LOST", None: "unknown"}[s.get("online")]
-        click.echo(f"sensor    : {s.get('interface')} {online}")
+        click.echo(f"sensor    : {printable(s.get('interface'))} {online}")
         stats = st.get("stats", {})
         click.echo(f"events    : {stats.get('processed', 0)} processed, last {st.get('last_event') or '-'}")
         click.echo("by type   : " + ", ".join(f"{k} {v}" for k, v in sorted(st.get("events_by_type", {}).items())))
@@ -543,7 +551,7 @@ def monitor_status(app: App) -> None:
                    f"{st.get('alerts', {}).get('suppressed', 0)} suppressed")
         click.echo(f"threat    : {st.get('threat_level')}")
     for row in sensor_rows:
-        click.echo(f"  {format_local(row['timestamp'])} {row['status']:<20} {row.get('interface') or ''}")
+        click.echo(printable(f"  {format_local(row['timestamp'])} {row['status']:<20} {row.get('interface') or ''}"))
     if recent:
         from .scoring import threat_level
         click.echo(f"last 5 min: {len(recent)} alert(s), threat level {threat_level(recent)}")
@@ -801,7 +809,7 @@ def alerts_cmd(app: App, since, min_severity, alert_type, limit, unacked, ack_id
         ack = " (ack)" if r["acknowledged"] else ""
         sup = f" +{r['suppressed_count']} suppressed" if r["suppressed_count"] else ""
         click.echo(f"#{r['id']:<5} {format_local(r['timestamp'])} {r['severity']:<8} {r['score']:>3} "
-                   f"{r['alert_type']:<36} {r['bssid'] or '':<17}{ack}{sup}")
+                   f"{printable(r['alert_type']):<36} {r['bssid'] or '':<17}{ack}{sup}")
         if details:
             for line in explain(r["score"], r["reason"].get("components", []))[1:]:
                 click.echo(f"        {printable(line)}")
