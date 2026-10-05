@@ -52,6 +52,8 @@ class FakeKismetState:
         self.requests = []
         self.device_fields_requested = []
         self.leak_extra_fields = False
+        self.redirect: str | None = None  # answer every request with a 302 to this URL
+        self.redirect_hits = 0
 
 
 def make_handler(state: FakeKismetState):
@@ -72,6 +74,15 @@ def make_handler(state: FakeKismetState):
 
         def _route(self, body=None):
             state.requests.append((self.command, self.path))
+            if urllib.parse.urlsplit(self.path).path == "/elsewhere":
+                state.redirect_hits += 1
+                return self._send(200, {"followed": True})
+            if state.redirect:
+                self.send_response(302)
+                self.send_header("Location", state.redirect)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return None
             if not self._authorized():
                 return self._send(401, {"error": "login required"})
             path = urllib.parse.urlsplit(self.path).path

@@ -80,6 +80,11 @@ def run_sensor_checks(cfg: Config, discovery: Discovery, guard: InterfaceGuard,
     else:
         names = ", ".join(sorted(before)) or "none"
         report.add("protected-interfaces", OK, f"unchanged ({names})")
+    missing = guard.missing_configured()
+    if missing:
+        report.add("protected-config", WARN, f"configured protected interface(s) not found: {', '.join(missing)}",
+                   "fix sensor.protected_interfaces: a misspelled name protects nothing "
+                   "(`sensor prepare --apply` refuses until it is fixed)")
     return report
 
 

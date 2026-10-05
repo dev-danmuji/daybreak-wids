@@ -2,8 +2,22 @@
 
 from __future__ import annotations
 
+import re
+
 from ..models import Alert, format_local
 from ..scoring import explain
+
+# C0/C1 control characters and Unicode bidi overrides: an attacker-chosen SSID or a relayed
+# Kismet alert text must not move the cursor, forge log lines or reorder what is shown.
+_UNPRINTABLE = re.compile("[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def printable(text: object) -> str:
+    """``text`` with control characters shown as ``\\xNN`` / ``\\uNNNN`` escapes."""
+    def esc(m: re.Match) -> str:
+        c = ord(m.group())
+        return f"\\x{c:02x}" if c < 0x100 else f"\\u{c:04x}"
+    return _UNPRINTABLE.sub(esc, str(text))
 
 
 def human_lines(alert: Alert) -> list[str]:
@@ -34,7 +48,7 @@ def human_lines(alert: Alert) -> list[str]:
         lines.append(f"Hint={d['hint']}")
     if alert.suppressed_count:
         lines.append(f"Suppressed={alert.suppressed_count} similar alert(s) since the previous one")
-    return lines
+    return [printable(line) for line in lines]
 
 
 def human_text(alert: Alert) -> str:

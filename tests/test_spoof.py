@@ -1,7 +1,7 @@
 import pytest
 import yaml
 
-from conftest import HOME_BSSID, HOME_BSSID_5G, ROGUE_BSSID, make_config
+from conftest import HOME_BSSID, HOME_BSSID_24G, ROGUE_BSSID, make_config
 from daybreak.config import load_config
 from daybreak.models import Event, Severity
 from daybreak.pipeline import Pipeline
@@ -130,7 +130,7 @@ def test_unconfigured_network_is_never_adopted(config):
 def test_similar_bssid_hint(config):
     p = Pipeline(config)
     alerts = run(p, [beacon(0), beacon(1, bssid="AA:BB:CC:DD:EE:F1")])
-    assert alerts[0].details["similar_to"] in (HOME_BSSID, HOME_BSSID_5G)
+    assert alerts[0].details["similar_to"] in (HOME_BSSID, HOME_BSSID_24G)
 
 
 def test_kismet_apspoof_with_cryptodrop_makes_twin(config):

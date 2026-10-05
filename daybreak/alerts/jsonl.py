@@ -4,25 +4,35 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import logging.handlers
 from pathlib import Path
 from typing import Any
 
+from ..fileperm import open_private_append, private_dir
 from ..models import Alert
 from .base import Notifier, register_notifier
 
 
+class PrivateRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """Size-rotated log whose files (also after rollover) are owner-only and never opened
+    through a symbolic link."""
+
+    def _open(self):  # noqa: ANN202 - logging API
+        return os.fdopen(open_private_append(self.baseFilename), "a", encoding=self.encoding,
+                         errors=self.errors)
+
+
 def rotating_logger(name: str, path: Path, *, max_bytes: int, backup_count: int) -> logging.Logger:
     """A dedicated logger writing raw lines to ``path`` with size-based rotation."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    private_dir(path.parent)
     logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.propagate = False
     for h in list(logger.handlers):
         logger.removeHandler(h)
         h.close()
-    handler = logging.handlers.RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backup_count,
-                                                   encoding="utf-8")
+    handler = PrivateRotatingFileHandler(path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
     return logger

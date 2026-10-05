@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 from .config import (
@@ -9,6 +10,8 @@ from .config import (
     validate_network,
 )
 from .models import AP_OBSERVATION_TYPES, Event, EventType
+
+_QUOTED = re.compile(r"'([^']{1,32})'|\"([^\"]{1,32})\"")
 
 
 class NetworkRegistry:
@@ -54,9 +57,11 @@ class NetworkRegistry:
                 net = self.by_bssid(mac)
                 if net:
                     return net
-            text = str(event.metadata.get("kismet_text", ""))
+            # Kismet quotes SSIDs in its alert texts ('...' or "..."): compare for equality, never
+            # as a substring (a neighbour 'myhome-5G' is not the protected network 'home').
+            quoted = {a or b for a, b in _QUOTED.findall(str(event.metadata.get("kismet_text", "")))}
             for net in self.networks:
-                if net.ssid and net.ssid in text:
+                if net.ssid and net.ssid in quoted:
                     return net
         return None
 

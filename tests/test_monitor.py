@@ -177,3 +177,22 @@ def test_passive_channel_hopping_is_guarded(tmp_path):
     backend = choose_backend(cfg, guard=guard, runner=runner)
     backend._tune(36)  # attempting to hop on a protected PHY is refused, never executed
     assert runner.executed == [] and "protected" in backend.errors[-1]
+
+
+def test_live_monitor_enforces_retention_but_replay_does_not(tmp_path):
+    rt = runtime(tmp_path, storage={"database": "var/test.db", "retention_days": 1})
+    old = T0 - 3 * 86400
+    rt.db.insert_events(deauths(3, start=-3 * 86400))
+    rt.db.upsert_station(mac="10:22:33:44:55:01", bssid=HOME_BSSID, network_id=None, timestamp=old)
+
+    class ReplayLike(FakeBackend):
+        name = "replay"
+
+    MonitorRunner(rt, ReplayLike([[]]), duration=2, clock=FakeClock(start=T0), sleep=lambda s: None).run()
+    assert len(rt.db.query_events(until=T0 - 86400)) == 3      # offline analysis keeps old events
+    messages = []
+    MonitorRunner(rt, FakeBackend([[]]), duration=2, clock=FakeClock(start=T0), sleep=lambda s: None,
+                  on_message=messages.append).run()
+    assert rt.db.query_events(until=T0 - 86400) == [] and rt.db.list_stations() == []
+    assert any(m.startswith("retention: removed 3 events") for m in messages)
+    rt.close()

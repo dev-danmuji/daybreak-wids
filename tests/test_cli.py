@@ -7,7 +7,7 @@ from click.testing import CliRunner
 
 import daybreak.cli as cli
 import daybreak.sensor.discovery as discovery
-from conftest import FIXTURES, HOME_BSSID, HOME_BSSID_5G
+from conftest import FIXTURES, HOME_BSSID, HOME_BSSID_24G
 from daybreak.safety import InterfaceGuard
 from helpers import host_runner, host_sysfs
 
@@ -16,7 +16,7 @@ from helpers import host_runner, host_sysfs
 def cfgfile(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump({
-        "protected_networks": [{"name": "home", "ssid": "ExampleSSID", "bssids": [HOME_BSSID, HOME_BSSID_5G],
+        "protected_networks": [{"name": "home", "ssid": "ExampleSSID", "bssids": [HOME_BSSID, HOME_BSSID_24G],
                                 "channels": [36, 6], "security": {"expected": ["WPA2", "WPA3"], "pmf": "capable"}}],
         "storage": {"database": "var/daybreak.db"},
         "logging": {"directory": "var/log"},
@@ -140,6 +140,8 @@ def fake_host(tmp_path, monkeypatch):
             super().__init__(runner, sysfs_root=fs.net, route_file=route)
 
     monkeypatch.setattr(discovery, "Discovery", FakeDiscovery)
+    # the simulated host runs the --apply tests "as root"
+    monkeypatch.setattr(discovery, "capability_effective", lambda *a, **kw: {"CAP_NET_ADMIN", "CAP_NET_RAW"})
     return fs, runners
 
 
@@ -180,3 +182,21 @@ def test_sensor_list_and_check(cfgfile, fake_host):
     assert "Monitor   : supported" in r.output and "Regdomain : KR" in r.output
     assert "protected-interfaces: unchanged (wlo1)" in r.output
     assert r.exit_code == 0
+
+
+def test_sensor_prepare_apply_needs_cap_net_admin(cfgfile, fake_host, monkeypatch):
+    fs, runners = fake_host
+    monkeypatch.setattr(discovery, "capability_effective", lambda *a, **kw: set())
+    r = run(cfgfile, "sensor", "prepare", "--apply", "--channel", "36")
+    assert r.exit_code == 1 and "needs CAP_NET_ADMIN" in r.output
+    assert all(not rr.executed for rr in runners)  # not even the polkit-authorised nmcli step
+
+
+def test_sensor_prepare_refuses_missing_protected_interface(tmp_path, fake_host):
+    fs, runners = fake_host
+    path = tmp_path / "typo.yaml"
+    path.write_text(yaml.safe_dump({"sensor": {"protected_interfaces": ["wlo2"]}}))  # typo: host has wlo1
+    r = CliRunner().invoke(cli.main, ["-c", str(path), "sensor", "prepare", "--apply"])
+    assert r.exit_code == 1 and "wlo2 not found" in r.output
+    assert all(not rr.executed for rr in runners)
+    assert f"config: {path}" in r.output

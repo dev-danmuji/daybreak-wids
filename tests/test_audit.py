@@ -1,5 +1,5 @@
 import frames_hex as F
-from conftest import HOME_BSSID, HOME_BSSID_5G, ROGUE_BSSID, make_config
+from conftest import HOME_BSSID, HOME_BSSID_24G, ROGUE_BSSID, make_config
 from daybreak.config import ProtectedNetwork, SecurityExpectation
 from daybreak.detectors.security import (
     INFO, OK, RISK, WARN, APObservation, assess_profile, audit_network, observations_from_rows,
@@ -60,11 +60,11 @@ def test_wps_detected_from_beacon_elements():
 
 
 def test_inconsistent_radios_and_unknown_bssids():
-    net = ProtectedNetwork(name="home", ssid="ExampleSSID", bssids=[HOME_BSSID, HOME_BSSID_5G],
+    net = ProtectedNetwork(name="home", ssid="ExampleSSID", bssids=[HOME_BSSID, HOME_BSSID_24G],
                            security=SecurityExpectation(expected=["WPA3"]))
     audit = audit_network(net, [
         APObservation(HOME_BSSID, prof(akms=["SAE"], pmf="required")),
-        APObservation(HOME_BSSID_5G, prof(akms=["PSK"], pmf="disabled")),
+        APObservation(HOME_BSSID_24G, prof(akms=["PSK"], pmf="disabled")),
         APObservation(ROGUE_BSSID, prof(akms=["PSK"], pmf="disabled")),
     ])
     lv = levels(audit.items)
@@ -110,3 +110,22 @@ def test_password_policy_checklist_never_takes_a_psk():
     ok = {i.key: i.status for i in policy_checklist(prof(akms=["SAE"], pmf="required"))}
     assert ok["wpa3"] == "ok" and ok["pmf"] == "ok"
     assert all(i.status == "check" for i in policy_checklist(None))
+
+
+def test_unregistered_bssids_are_flagged_even_if_the_ap_is_not_heard():
+    net = make_config_network()
+    obs = [APObservation(bssid=f"02:00:00:00:00:{i:02X}", profile=None, channel=36, last_seen=float(i))
+           for i in range(25)]
+    audit = audit_network(net, obs)
+    titles = [i.title for i in audit.items]
+    assert "unregistered BSSIDs advertise this SSID" in titles and "not observed" in titles
+    detail = next(i.detail for i in audit.items if i.title.startswith("unregistered"))
+    assert detail.endswith("(+5 more)") and detail.count(":") == 20 * 5
+    text = render_audit(audit)
+    assert "02:00:00:00:00:18" in text and "02:00:00:00:00:04" not in text  # most recent 20 listed
+    assert "... and 5 more (most recently seen shown)" in text
+
+
+def make_config_network():
+    return ProtectedNetwork(name="home", ssid="ExampleSSID", bssids=[HOME_BSSID, HOME_BSSID_24G],
+                            security=SecurityExpectation(expected=["WPA2", "WPA3"], pmf="capable"))

@@ -19,7 +19,8 @@ def test_example_config_loads():
     assert cfg.safety.passive_only and not cfg.safety.packet_injection
     assert not cfg.safety.transmit_management_frames
     home = cfg.network("home")
-    assert home.bssids == ["AA:BB:CC:DD:EE:FF"] and home.status == "configured"
+    assert home.bssids == ["AA:BB:CC:DD:EE:FF", "AA:BB:CC:DD:EE:F0"] and home.status == "configured"
+    assert home.channels == [36, 6]
     assert home.security.expected == ["WPA2", "WPA3"]
     assert cfg.database_path == ROOT / "var" / "daybreak.db"
 
@@ -115,3 +116,22 @@ def test_registry_roundtrip(tmp_path):
 def test_unknown_weight_rejected(tmp_path):
     with pytest.raises(ConfigError, match="unknown scoring weight"):
         config_from_dict({"scoring": {"weights": {"deauth_brust": 10}}}, base_dir=tmp_path)
+
+
+def test_kismet_url_must_not_carry_credentials(tmp_path):
+    for url in ("http://admin:secret@127.0.0.1:2501", "http://admin@127.0.0.1:2501"):
+        with pytest.raises(ConfigError, match="must not contain credentials"):
+            config_from_dict({"backend": {"kismet": {"url": url}}}, base_dir=tmp_path)
+
+
+def test_retention_and_dashboard_host_validation(tmp_path):
+    with pytest.raises(ConfigError, match="retention_days"):
+        config_from_dict({"storage": {"retention_days": -1}}, base_dir=tmp_path)
+    assert config_from_dict({"storage": {"retention_days": 0}}, base_dir=tmp_path).storage.retention_days == 0
+    for host in ("::1", "[::1]", "127.0.0.2", "localhost"):
+        assert config_from_dict({"dashboard": {"host": host}}, base_dir=tmp_path).dashboard.host == host
+    with pytest.raises(ConfigError, match="loopback"):
+        config_from_dict({"dashboard": {"host": "0.0.0.0"}}, base_dir=tmp_path)
+    with pytest.raises(ConfigError, match="allowed_hosts"):
+        config_from_dict({"dashboard": {"host": "0.0.0.0", "allow_remote": True,
+                                        "allowed_hosts": ["wids lan"]}}, base_dir=tmp_path)

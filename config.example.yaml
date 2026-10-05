@@ -50,13 +50,17 @@ safety:
 
 # Networks you administer. Without bssids a network is shown as "unconfigured"
 # and no nearby AP is ever adopted automatically.
+# Example: one dual-band router = one SSID with a 5 GHz and a 2.4 GHz BSSID
+# (synthetic values, the same as in tests/fixtures/).
 protected_networks:
   - name: home
     ssid: ExampleSSID
     bssids:
-      - "AA:BB:CC:DD:EE:FF"
+      - "AA:BB:CC:DD:EE:FF"   # 5 GHz radio
+      - "AA:BB:CC:DD:EE:F0"   # 2.4 GHz radio
     channels:
       - 36
+      - 6
     security:
       expected:
         - WPA2
@@ -120,6 +124,7 @@ scoring:
     concurrent_deauth: 15
     kismet_other: 10
     sensor_lost: 50
+    protected_interface_changed: 50
 
 alerts:
   cooldown: 300               # seconds before the same alert may repeat
@@ -135,6 +140,8 @@ alerts:
 
 storage:
   database: var/daybreak.db
+  # The live monitor deletes events, alerts, sensor status and station/AP records older
+  # than this (hourly). 0 keeps everything. Replays and pcap analysis never prune.
   retention_days: 30
 
 logging:
@@ -148,4 +155,7 @@ logging:
 dashboard:
   host: 127.0.0.1
   port: 8765
+  # The dashboard has no authentication. Only with allow_remote may it bind to another
+  # address; the Host header must then match the bind address or one of allowed_hosts.
   allow_remote: false
+  allowed_hosts: []

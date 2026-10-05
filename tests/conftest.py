@@ -13,7 +13,7 @@ FIXTURES = Path(__file__).parent / "fixtures"
 
 # BSSIDs used by the synthetic fixtures (documentation/example ranges only).
 HOME_BSSID = "AA:BB:CC:DD:EE:FF"
-HOME_BSSID_5G = "AA:BB:CC:DD:EE:F0"
+HOME_BSSID_24G = "AA:BB:CC:DD:EE:F0"
 ROGUE_BSSID = "02:13:37:00:00:01"
 
 
@@ -49,7 +49,7 @@ def make_config(tmp_path: Path, **overrides):
             {
                 "name": "home",
                 "ssid": "ExampleSSID",
-                "bssids": [HOME_BSSID, HOME_BSSID_5G],
+                "bssids": [HOME_BSSID, HOME_BSSID_24G],
                 "channels": [36, 6],
                 "security": {"expected": ["WPA2", "WPA3"], "pmf": "capable"},
             },

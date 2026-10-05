@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from daybreak.safety import COMMAND_ALLOW_LIST
+
 PKG = Path(__file__).resolve().parents[1] / "daybreak"
 SOURCES = sorted(PKG.rglob("*.py"))
 
@@ -131,18 +133,9 @@ def test_no_management_frame_templates():
                 assert not re.search(rb"[\xc0\xa0]\x00", const.value), f"{_rel(path)}:{const.lineno}"
 
 
-ALLOWED_HOST_COMMANDS = [
-    ("iw", "phy", None, "info"),
-    ("iw", "dev", None, "info"),
-    ("iw", "reg", "get"),
-    ("iw", "dev", None, "set", "type", {"monitor", "managed"}),
-    ("iw", "dev", None, "set", "channel", None),
-    ("ip", "link", "set", None, {"up", "down"}),
-    ("nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"),
-    ("nmcli", "-t", "-f", "DEVICE,STATE", "device", "status"),
-    ("nmcli", "device", "set", None, "managed", {"yes", "no"}),
-    ("notify-send", None),
-]
+# Single source of truth: the runtime allow-list enforced by CommandRunner, plus notify-send
+# (run by the desktop notifier, fixed arguments).
+ALLOWED_HOST_COMMANDS = [pattern for pattern, _mutating in COMMAND_ALLOW_LIST] + [("notify-send", None)]
 
 
 def _literal_argv(node: ast.List) -> list[object] | None:
@@ -163,7 +156,7 @@ def _matches(argv: list[object], pattern: tuple) -> bool:
     for got, want in zip(argv, pattern):
         if want is None:
             continue
-        if isinstance(want, set):
+        if isinstance(want, (set, frozenset)):
             if got is not None and got not in want:
                 return False
             continue

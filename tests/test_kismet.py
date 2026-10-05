@@ -214,10 +214,34 @@ def test_backend_uses_eventbus_alerts(kismet):
     assert found
 
 
-def test_eventbus_url():
-    assert eventbus_url("http://127.0.0.1:2501", "k", None, None) == \
-        "ws://127.0.0.1:2501/eventbus/events.ws?KISMET=k"
-    assert eventbus_url("https://h:2501/", None, "u", "p").startswith("wss://h:2501/eventbus/events.ws?user=u")
+def test_eventbus_url_carries_no_credentials():
+    assert eventbus_url("http://127.0.0.1:2501") == "ws://127.0.0.1:2501/eventbus/events.ws"
+    assert eventbus_url("https://h:2501/kismet/") == "wss://h:2501/kismet/eventbus/events.ws"
+    assert KismetClient("http://x", api_key="k").auth_headers() == {"Cookie": "KISMET=k"}
+    assert KismetClient("http://x", username="u", password="p").auth_headers() == {"Authorization": "Basic dTpw"}
+
+
+def test_eventbus_sends_credentials_as_headers_without_proxy(monkeypatch):
+    websocket = pytest.importorskip("websocket")
+    seen = {}
+
+    def fake_create_connection(url, **kw):
+        seen.update(url=url, **kw)
+        raise ConnectionError("stop")
+
+    monkeypatch.setattr(websocket, "create_connection", fake_create_connection)
+    reader = EventbusReader(eventbus_url("http://127.0.0.1:2501"), queue.Queue(), headers={"Cookie": "KISMET=k"})
+    with pytest.raises(ConnectionError):
+        reader._open()
+    assert "KISMET" not in seen["url"] and seen["header"] == ["Cookie: KISMET=k"]
+    assert seen["http_no_proxy"] == ["*"]
+
+
+def test_client_refuses_redirects(kismet):
+    kismet.state.redirect = f"{kismet.url}/elsewhere"  # would receive the API key cookie
+    with pytest.raises(KismetError, match="HTTP 302"):
+        client_for(kismet).system_status()
+    assert kismet.state.redirect_hits == 0
 
 
 # -- check / config ----------------------------------------------------------------------------------------

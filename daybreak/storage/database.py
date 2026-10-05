@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from ..fileperm import private_dir, secure_path
 from ..models import Alert, Event, EventType, Severity, sanitize_metadata
 from .migrations import migrate
 
@@ -26,11 +27,11 @@ class Database:
         self.readonly = readonly
         self._lock = threading.RLock()
         if self.path != ":memory:" and not readonly:
-            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+            if Path(self.path).is_symlink():
+                raise sqlite3.OperationalError(f"refusing to open a symlinked database path: {self.path}")
+            private_dir(Path(self.path).parent)
         if readonly:
-            uri = f"file:{Path(self.path).resolve()}?mode=ro"
-            self.conn = sqlite3.connect(uri, uri=True, timeout=10, check_same_thread=False,
-                                        isolation_level=None)
+            self.conn = self._connect_readonly(Path(self.path))
         else:
             self.conn = sqlite3.connect(self.path, timeout=10, check_same_thread=False,
                                         isolation_level=None)
@@ -40,7 +41,35 @@ class Database:
             if self.path != ":memory:":
                 self.conn.execute("PRAGMA journal_mode = WAL")
             self.conn.execute("PRAGMA synchronous = NORMAL")
+            self.conn.execute("PRAGMA secure_delete = ON")  # pruned rows are overwritten, not left in free pages
             migrate(self.conn)
+            if self.path != ":memory:":
+                for suffix in ("", "-wal", "-shm"):  # metadata incl. MAC addresses: owner-only
+                    secure_path(self.path + suffix)
+
+    @staticmethod
+    def _connect_readonly(path: Path) -> sqlite3.Connection:
+        """Open without ever writing (no WAL switch, no migration, no file creation).
+
+        ``Path.as_uri`` percent-encodes the path, so names with ``%``, ``#`` or ``?``
+        cannot turn into a different (writable) URI. A WAL database whose ``-shm``
+        file is gone, in a directory this user cannot write (a root-run monitor that
+        has stopped), cannot be opened plainly read-only; it is then opened
+        ``immutable``, which is accurate once no writer has a WAL pending.
+        """
+        base = path.resolve().as_uri()
+        error: sqlite3.Error | None = None
+        for query in ("?mode=ro", "?mode=ro&immutable=1"):
+            conn = sqlite3.connect(base + query, uri=True, timeout=10, check_same_thread=False,
+                                   isolation_level=None)
+            try:
+                conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+                return conn
+            except sqlite3.Error as exc:
+                conn.close()
+                error = exc
+        assert error is not None
+        raise error
 
     def close(self) -> None:
         with self._lock:
@@ -197,6 +226,21 @@ class Database:
         sql += " GROUP BY event_type"
         return {r[0]: int(r[1]) for r in self._query(sql, params)}
 
+    def event_buckets(self, *, since: float, until: float, bucket: float,
+                      event_types: Sequence[str] = ()) -> dict[int, dict[str, int]]:
+        """Event counts per time bucket and type, aggregated in SQL (no rows are loaded)."""
+        sql = ("SELECT CAST((timestamp - ?) / ? AS INTEGER) AS b, event_type, COUNT(*) FROM events "
+               "WHERE timestamp >= ? AND timestamp < ?")
+        params: list[Any] = [since, bucket, since, until]
+        if event_types:
+            sql += f" AND event_type IN ({','.join('?' * len(event_types))})"
+            params.extend(event_types)
+        sql += " GROUP BY b, event_type"
+        out: dict[int, dict[str, int]] = {}
+        for b, etype, count in self._query(sql, params):
+            out.setdefault(int(b), {})[etype] = int(count)
+        return out
+
     def event_time_range(self) -> tuple[float, float] | None:
         row = self._query("SELECT MIN(timestamp), MAX(timestamp) FROM events")[0]
         return (row[0], row[1]) if row[0] is not None else None
@@ -227,7 +271,13 @@ class Database:
              sec_json, _dumps(dict(phy)) if phy else None, rssi, timestamp, timestamp),
         )
 
-    def list_aps(self, *, ssid: str | None = None, network_id: int | None = None) -> list[dict[str, Any]]:
+    def list_aps(self, *, ssid: str | None = None, network_id: int | None = None,
+                 limit: int | None = None) -> list[dict[str, Any]]:
+        """APs ordered by SSID, registered first, then BSSID.
+
+        With ``limit``, registered APs and then the most recently seen others are kept
+        (a beacon flood with random BSSIDs cannot make the result unbounded).
+        """
         sql = "SELECT * FROM aps WHERE 1=1"
         params: list[Any] = []
         if ssid is not None:
@@ -236,14 +286,28 @@ class Database:
         if network_id is not None:
             sql += " AND network_id = ?"
             params.append(network_id)
-        sql += " ORDER BY ssid, authorized DESC, bssid"
+        if limit:
+            sql += " ORDER BY COALESCE(authorized, 0) DESC, last_seen DESC LIMIT ?"
+            params.append(int(limit))
+            rows = sorted(self._query(sql, params), key=lambda r: (r["ssid"], -(r["authorized"] or 0), r["bssid"]))
+        else:
+            sql += " ORDER BY ssid, authorized DESC, bssid"
+            rows = self._query(sql, params)
         out = []
-        for r in self._query(sql, params):
+        for r in rows:
             d = dict(r)
             d["security"] = json.loads(d.pop("security_json") or "null")
             d["phy"] = json.loads(d.pop("phy_json") or "null")
             out.append(d)
         return out
+
+    def count_aps(self, *, ssid: str, exclude_bssids: Sequence[str] = ()) -> int:
+        sql = "SELECT COUNT(*) FROM aps WHERE ssid = ?"
+        params: list[Any] = [ssid]
+        if exclude_bssids:
+            sql += f" AND bssid NOT IN ({','.join('?' * len(exclude_bssids))})"
+            params.extend(exclude_bssids)
+        return int(self._query(sql, params)[0][0])
 
     def upsert_station(self, *, mac: str, bssid: str | None, network_id: int | None,
                        timestamp: float, eapol: int = 0, disconnect: int = 0, connect: int = 0) -> None:
@@ -288,14 +352,17 @@ class Database:
             (timestamp, alert_id),
         )
 
-    def list_alerts(self, *, since: float | None = None, min_severity: Severity | None = None,
-                    alert_type: str | None = None, unacknowledged: bool = False,
-                    limit: int | None = 50) -> list[dict[str, Any]]:
+    def list_alerts(self, *, since: float | None = None, until: float | None = None,
+                    min_severity: Severity | None = None, alert_type: str | None = None,
+                    unacknowledged: bool = False, limit: int | None = 50) -> list[dict[str, Any]]:
         sql = "SELECT * FROM alerts WHERE 1=1"
         params: list[Any] = []
         if since is not None:
             sql += " AND timestamp >= ?"
             params.append(since)
+        if until is not None:
+            sql += " AND timestamp <= ?"
+            params.append(until)
         if min_severity is not None:
             allowed = [s.name for s in Severity if s >= min_severity]
             sql += f" AND severity IN ({','.join('?' * len(allowed))})"
@@ -387,10 +454,17 @@ class Database:
 
     # -- maintenance -----------------------------------------------------------------------------
     def prune(self, *, older_than: float) -> dict[str, int]:
+        """Retention: delete events, alerts and sensor status older than ``older_than`` and
+        station / AP records not seen since. Networks and baselines are kept."""
+        statements = {
+            "events": "DELETE FROM events WHERE timestamp < ?",
+            "alerts": "DELETE FROM alerts WHERE COALESCE(last_seen, timestamp) < ?",
+            "sensor_status": "DELETE FROM sensor_status WHERE timestamp < ?",
+            "stations": "DELETE FROM stations WHERE last_seen < ?",
+            "aps": "DELETE FROM aps WHERE last_seen < ?",
+        }
         with self.transaction() as conn:
-            ev = conn.execute("DELETE FROM events WHERE timestamp < ?", (older_than,)).rowcount
-            st = conn.execute("DELETE FROM sensor_status WHERE timestamp < ?", (older_than,)).rowcount
-        return {"events": ev, "sensor_status": st}
+            return {table: conn.execute(sql, (older_than,)).rowcount for table, sql in statements.items()}
 
     def table_names(self) -> list[str]:
         return [r[0] for r in self._query(

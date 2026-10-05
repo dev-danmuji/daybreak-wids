@@ -451,26 +451,24 @@ SENSITIVE_METADATA_KEYS = frozenset({
 _MAX_TEXT = 512
 
 
-def _sanitize_value(value: Any, depth: int = 0) -> Any:
+_PHY_KEYS = frozenset({"ht", "vht", "he", "eht"})
+
+
+def _sanitize_value(key: str, value: Any) -> Any:
+    """Scalars only. ``phy`` is the one structured key, with a fixed schema of booleans:
+    mappings and lists cannot smuggle key material under an allowed key."""
+    if key == "phy":
+        if isinstance(value, Mapping):
+            clean = {k: v for k, v in value.items() if k in _PHY_KEYS and isinstance(v, bool)}
+            return clean or None
+        return None
     if value is None or isinstance(value, (bool, int)):
         return value
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
         return value[:_MAX_TEXT]
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return None  # never persist raw bytes
-    if isinstance(value, Mapping) and depth < 1:
-        return {
-            str(k): _sanitize_value(v, depth + 1)
-            for k, v in value.items()
-            if str(k).lower() not in SENSITIVE_METADATA_KEYS
-            and isinstance(v, (bool, int, float, str, type(None)))
-        }
-    if isinstance(value, (list, tuple)) and depth < 1:
-        return [_sanitize_value(v, depth + 1) for v in value[:32]
-                if isinstance(v, (bool, int, float, str, type(None)))]
-    return None
+    return None  # bytes, mappings, lists and anything else are never persisted
 
 
 def sanitize_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -482,7 +480,7 @@ def sanitize_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
         k = str(key)
         if k.lower() in SENSITIVE_METADATA_KEYS or k not in ALLOWED_METADATA_KEYS:
             continue
-        clean = _sanitize_value(value)
+        clean = _sanitize_value(k, value)
         if clean is not None:
             out[k] = clean
     return out

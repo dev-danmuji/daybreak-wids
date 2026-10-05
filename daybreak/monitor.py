@@ -2,23 +2,31 @@
 
 from __future__ import annotations
 
+import contextlib
+import glob
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 from .detectors.base import SENSOR_LOST, SENSOR_RECOVERED
+from .fileperm import private_dir, secure_path
 from .models import iso_utc
-from .pipeline import sensor_alert
+from .pipeline import protected_alert, sensor_alert
 from .runtime import Runtime
 from .scoring import threat_level
 from .sensor.backend import Backend, BackendUnavailable
 from .sensor.status import HealthTransition, SensorHealthMonitor
 
 log = logging.getLogger("daybreak.monitor")
+
+OFFLINE_BACKENDS = {"replay", "pcap"}
+PRUNE_INTERVAL = 3600.0  # seconds between retention passes
+PROTECTED_CHECK_INTERVAL = 10.0  # seconds between protected-interface verifications
 
 STATUS_FILE = "monitor.status.json"
 
@@ -52,7 +60,8 @@ class MonitorRunner:
                  duration: float | None = None, write_status: bool = True,
                  recover: Callable[[str], bool] | None = None,
                  clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
-                 stop: threading.Event | None = None, on_message: Callable[[str], None] | None = None):
+                 stop: threading.Event | None = None, on_message: Callable[[str], None] | None = None,
+                 guard: Any = None):
         self.rt = runtime
         self.backend = backend
         self.health = health
@@ -71,7 +80,64 @@ class MonitorRunner:
         self.sensor_online: bool | None = None
         self.next_health = 0.0
         self.next_status = 0.0
+        self.next_prune = 0.0
         self.started = 0.0
+        # Live runs: protected interfaces are verified continuously, not only around commands.
+        self.guard = guard
+        self.protected_before: dict[str, Any] | None = None
+        self.protected_changes: dict[str, list[str]] = {}
+        self.next_protected = 0.0
+
+    # -- retention ---------------------------------------------------------------
+    def _prune(self, now: float) -> None:
+        """storage.retention_days, enforced by the live monitor (never during a replay or pcap
+        analysis, whose events may legitimately be older than the retention period)."""
+        days = self.cfg.storage.retention_days
+        if self.rt.db is None or days <= 0 or self.backend.name in OFFLINE_BACKENDS:
+            return
+        cutoff = now - days * 86400
+        removed = self.rt.db.prune(older_than=cutoff)
+        removed["rotated log files"] = self._prune_rotated_logs(cutoff)
+        if any(removed.values()):
+            self.say("retention: removed " + ", ".join(f"{n} {t}" for t, n in removed.items() if n)
+                     + f" older than {days} days")
+
+    def _prune_rotated_logs(self, cutoff: float) -> int:
+        """Rotated backups (``daybreak.log.N``, ``alerts.jsonl.N``) last written before ``cutoff``.
+        The active files are size-rotated and may hold older lines until they rotate."""
+        count = 0
+        log_dir = self.cfg.log_dir
+        for name in (self.cfg.logging.human_log, self.cfg.logging.jsonl_log):
+            for old in log_dir.glob(glob.escape(name) + ".*"):
+                if not old.name[len(name) + 1:].isdigit() or old.is_symlink() or not old.is_file():
+                    continue
+                if old.stat().st_mtime < cutoff:
+                    with contextlib.suppress(OSError):
+                        old.unlink()
+                        count += 1
+        return count
+
+    # -- protected interfaces -----------------------------------------------------
+    def _check_protected(self, now: float) -> None:
+        if self.guard is None or self.protected_before is None:
+            return
+        changes = self.guard.verify_unchanged(self.protected_before, self.guard.snapshot_protected())
+        if changes == self.protected_changes:
+            return
+        self.protected_changes = changes
+        if not changes:
+            self.say("protected interfaces are back to their state at start")
+            self._record("PROTECTED_RESTORED", {})
+            return
+        detail = "; ".join(f"{name}: {', '.join(diff)}" for name, diff in sorted(changes.items()))
+        if self.recover is not None:
+            self.recover = None  # no further sensor re-preparation in this run
+        self.say(f"PROTECTED_INTERFACE_CHANGED {detail} (daybreak-wids sends no commands to protected "
+                 "interfaces); auto_prepare disabled for this run")
+        self._record("PROTECTED_CHANGED", {"changes": changes})
+        self.rt.pipeline.emit_external(protected_alert(
+            now, changes, sensor=self.cfg.sensor.interface,
+            weight=self.cfg.scoring.weight("protected_interface_changed")))
 
     # -- status ------------------------------------------------------------------
     def _record(self, status: str, details: dict[str, Any] | None = None) -> None:
@@ -106,10 +172,18 @@ class MonitorRunner:
         if not self.write_status:
             return
         path = status_path(self.rt)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._status_doc(state), indent=2, default=str), encoding="utf-8")
-        tmp.replace(path)
+        private_dir(path.parent)
+        # mkstemp (O_CREAT|O_EXCL) never follows a planted symlink; rename replaces the link itself.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".monitor.status.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self._status_doc(state), fh, indent=2, default=str)
+            secure_path(tmp)
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            raise
 
     # -- sensor health ---------------------------------------------------------------
     def _transition(self, t: HealthTransition, reason: str | None = None) -> None:
@@ -142,10 +216,17 @@ class MonitorRunner:
     def _check_health(self, now: float) -> None:
         if self.health is None:
             return
+        tracked = self.health.interface
         t = self.health.check(now)
         if t is not None:
             self._transition(t)
             return
+        if self.health.interface != tracked:
+            self.say(f"sensor adapter {self.health.expected_mac} is now tracked as {self.health.interface} "
+                     f"(was {tracked})")
+            if self.backend.name == "passive":
+                self.backend.set_interface(self.health.interface)
+                self.backend_open = False
         # Kismet can report its datasource failing while the interface still exists.
         if self.backend_open and self.backend.name == "kismet":
             st = self.backend.status()
@@ -188,6 +269,8 @@ class MonitorRunner:
     # -- main loop ---------------------------------------------------------------------------
     def run(self) -> dict[str, Any]:
         self.started = self.clock()
+        if self.guard is not None:
+            self.protected_before = self.guard.snapshot_protected()
         self._write_status("running")
         try:
             while not self.stop.is_set():
@@ -197,6 +280,12 @@ class MonitorRunner:
                 if now >= self.next_health:
                     self._check_health(now)
                     self.next_health = now + self.cfg.sensor.health_check_interval
+                if now >= self.next_prune:
+                    self._prune(now)
+                    self.next_prune = now + PRUNE_INTERVAL
+                if self.guard is not None and now >= self.next_protected:
+                    self._check_protected(now)
+                    self.next_protected = now + PROTECTED_CHECK_INTERVAL
                 if not self.backend_open:
                     self._try_open(now)
                     if not self.backend_open:

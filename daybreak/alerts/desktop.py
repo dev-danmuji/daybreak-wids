@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 import shutil
 import subprocess
@@ -46,8 +47,11 @@ class DesktopNotifier(Notifier):
         if note:
             body += f"\n({note})"
         try:
+            # Notification servers interpret body markup (<a href>, <img>); SSIDs and Kismet texts
+            # are attacker-controlled, so send plain text only.
             self._run(["notify-send", "--app-name=daybreak-wids", f"--urgency={_URGENCY[alert.severity]}",
-                       title, body[:500]], check=False, timeout=5, capture_output=True)
+                       html.escape(title, quote=False), html.escape(body[:500], quote=False)],
+                      check=False, timeout=5, capture_output=True)
         except (OSError, subprocess.SubprocessError) as exc:
             self.errors += 1
             self.last_error = str(exc)

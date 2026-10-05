@@ -29,11 +29,25 @@ class OperationReport:
 
 class SensorController:
     def __init__(self, interface: str, guard: InterfaceGuard, runner: CommandRunner,
-                 *, nm_running: bool | None = True):
+                 *, nm_running: bool | None = True, expected_mac: str | None = None):
         self.interface = interface
         self.guard = guard
         self.runner = runner
         self.nm_running = nm_running
+        # The sensor's MAC (configured, or learned on first use): a command is never sent to
+        # an interface name that now belongs to another adapter (USB re-enumeration).
+        self.expected_mac = expected_mac.upper() if expected_mac else None
+
+    def _check_target(self) -> tuple[str | None, str | None]:
+        """Guard + adapter identity check; returns the (ifindex, MAC) the commands may run on."""
+        self.guard.assert_may_modify(self.interface)
+        ident = self.guard.identity(self.interface)
+        if self.expected_mac and ident[1] != self.expected_mac:
+            raise SafetyViolation(f"refusing to modify {self.interface}: MAC {ident[1]} is not the sensor "
+                                  f"adapter ({self.expected_mac})")
+        if self.expected_mac is None and ident[1]:
+            self.expected_mac = ident[1]
+        return ident
 
     # -- plans ----------------------------------------------------------------
     def plan_prepare(self, channel: int | None = None) -> list[list[str]]:
@@ -69,12 +83,20 @@ class SensorController:
             if self.interface not in argv:
                 raise SafetyViolation(f"command does not target the sensor interface: {argv}")
         try:
-            self.guard.assert_may_modify(self.interface)
+            ident = self._check_target()
         except SafetyViolation as exc:
             report.error = str(exc)
             return report
         before = self.guard.snapshot_protected()
         for argv in plan:
+            # Re-check before every step: names, routes and NetworkManager state can change
+            # while a plan runs (right after a USB re-enumeration in particular).
+            try:
+                if self._check_target() != ident:
+                    raise SafetyViolation(f"{self.interface} changed identity during {action}; stopping")
+            except SafetyViolation as exc:
+                report.error = str(exc)
+                break
             res = self.runner.run(argv, mutating=True)
             report.results.append(res)
             if not res.ok:
@@ -91,6 +113,6 @@ class SensorController:
         return self._execute("release", self.plan_release())
 
     def set_channel(self, channel: int) -> CommandResult:
-        self.guard.assert_may_modify(self.interface)
+        self._check_target()
         return self.runner.run(["iw", "dev", self.interface, "set", "channel", str(int(channel))],
                                mutating=True)

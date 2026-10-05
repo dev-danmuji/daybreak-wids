@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -18,7 +20,9 @@ from typing import Any, Callable
 import click
 
 from . import __version__
+from .alerts.formatting import printable
 from .config import ConfigError, load_config
+from .fileperm import PRIVATE_UMASK
 from .models import Severity, format_local
 from .safety import CommandRunner, InterfaceGuard, SafetyViolation
 
@@ -44,6 +48,10 @@ class App:
         self._config = None
         return self.config
 
+    def config_source(self) -> str:
+        cfg = self.config
+        return str(cfg.path) if cfg.path else f"built-in defaults (no config file; data in {cfg.base_dir})"
+
     def database(self, *, required: bool = True):
         from .storage import Database
         path = self.config.database_path
@@ -63,6 +71,9 @@ def handle_errors(func: Callable) -> Callable:
             raise click.ClickException(f"safety: {exc}") from exc
         except (ConfigError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
+        except sqlite3.Error as exc:
+            raise click.ClickException(f"database: {exc} (files written by a root-run monitor? see README: "
+                                       "Data, logs and file locations)") from exc
     return wrapper
 
 
@@ -85,7 +96,7 @@ def parse_since(text: str | None, default: float | None = 86400.0) -> float | No
 
 
 def table(rows: list[list[Any]], headers: list[str]) -> str:
-    cells = [headers] + [["" if c is None else str(c) for c in r] for r in rows]
+    cells = [headers] + [["" if c is None else printable(c) for c in r] for r in rows]
     widths = [max(len(r[i]) for r in cells) for i in range(len(headers))]
     out = ["  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in cells]
     out.insert(1, "  ".join("-" * w for w in widths))
@@ -110,6 +121,7 @@ def main(ctx: click.Context, config_path: str | None, dry_run: bool, json_out: b
     Authorized defensive monitoring only. This tool does not implement packet
     injection, deauthentication attacks, credential cracking, or password recovery.
     """
+    os.umask(PRIVATE_UMASK)  # database, logs and registry contain MAC addresses: owner-only files
     ctx.obj = App(config_path, dry_run, json_out, verbose)
 
 
@@ -210,21 +222,33 @@ def _sensor_operation(app: App, action: str, apply: bool, channel: int | None) -
     guard = InterfaceGuard(cfg.sensor.protected_interfaces, runner=runner)
     disc = Discovery(runner)
     disc.interfaces()
-    ctl = SensorController(cfg.sensor.interface, guard, runner, nm_running=disc.nm_running)
+    ctl = SensorController(cfg.sensor.interface, guard, runner, nm_running=disc.nm_running,
+                           expected_mac=cfg.sensor.expected_mac)
     plan = ctl.plan_prepare(channel) if action == "prepare" else ctl.plan_release()
+    click.echo(f"config: {app.config_source()}")
     click.echo(f"{action} {cfg.sensor.interface} (sensor only; protected: "
                f"{', '.join(sorted(guard.protected_set())) or 'none'})")
     for argv in plan:
         click.echo("  " + " ".join(argv))
+    missing = guard.missing_configured()
+    problem = (f"protected interface(s) {', '.join(missing)} not found: fix sensor.protected_interfaces "
+               "(a misspelled name protects nothing)") if missing else None
     if not execute:
         click.echo("\nNot executed" + (" (--dry-run)." if app.dry_run else ". Re-run with --apply to execute."))
         try:
             guard.assert_may_modify(cfg.sensor.interface)
         except SafetyViolation as exc:
             raise click.ClickException(f"would be refused: {exc}") from exc
+        if problem:
+            raise click.ClickException(f"would be refused: {problem}")
         return
+    if problem:
+        raise click.ClickException(f"refused: {problem}")
     if "CAP_NET_ADMIN" not in capability_effective():
-        click.echo("warning: CAP_NET_ADMIN missing; run with sudo", err=True)
+        # Without it only the polkit-authorised nmcli step would succeed, leaving the sensor
+        # unmanaged but still in managed mode.
+        raise click.ClickException(f"{action} --apply needs CAP_NET_ADMIN: run it with sudo "
+                                   "(see README: Passive backend)")
     report = ctl.prepare(channel) if action == "prepare" else ctl.release()
     for res in report.results:
         mark = "ok" if res.ok else "FAILED"
@@ -321,30 +345,66 @@ def _build_live(app: App, backend_kind: str | None, replay: str | None, pcap: st
     health = SensorHealthMonitor(cfg.sensor.interface, expected_mac=cfg.sensor.expected_mac) if live else None
     recover = None
     if live and backend.name == "passive" and cfg.sensor.auto_prepare and not app.dry_run:
-        recover = functools.partial(_recover_sensor, cfg, guard, runner)
+        recover = SensorRecovery(cfg, guard, runner)
     return backend, health, recover, guard
 
 
-def _recover_sensor(cfg: Any, guard: InterfaceGuard, runner: CommandRunner, interface: str) -> bool:
-    """After a USB reset: re-enable monitor mode on the *sensor* (never a protected interface)."""
-    from .sensor.control import SensorController
-    from .sensor.discovery import capability_effective
-    from .sensor.passive import interface_linktype
-    from .sensor.select import listen_channels
+class SensorRecovery:
+    """auto_prepare after a USB reset: re-enable monitor mode on the *sensor* only.
 
-    if interface_linktype(interface) is not None:
-        return True
-    if "CAP_NET_ADMIN" not in capability_effective():
-        click.echo(f"sensor {interface} is back in managed mode; run `sudo daybreak-wids sensor prepare "
-                   "--apply` (NetworkManager may manage it again after a USB reset; see `sensor check`)",
-                   err=True)
-        return False
-    channels = listen_channels(cfg)
-    report = SensorController(interface, guard, runner).prepare(channels[0] if channels else None)
-    if not report.ok:
-        click.echo(f"could not restore monitor mode on {interface}: {report.error or report.protected_changes}",
-                   err=True)
-    return report.ok
+    The re-found interface must be the configured sensor (same name, or the expected MAC and
+    driver); every command still passes the interface guard. Once a protected interface
+    changes during a recovery, recovery stays off for the rest of the run.
+    """
+
+    def __init__(self, cfg: Any, guard: InterfaceGuard, runner: CommandRunner):
+        self.cfg, self.guard, self.runner = cfg, guard, runner
+        self.disabled: str | None = None
+
+    def is_sensor(self, interface: str, found: Any) -> bool:
+        sc = self.cfg.sensor
+        if found is None:
+            return False
+        if sc.expected_mac and (found.mac or "").upper() != sc.expected_mac.upper():
+            return False
+        if sc.expected_driver and found.driver != sc.expected_driver:
+            return False
+        return interface == sc.interface or bool(sc.expected_mac)
+
+    def __call__(self, interface: str) -> bool:
+        from .sensor.control import SensorController
+        from .sensor.discovery import Discovery, capability_effective
+        from .sensor.passive import interface_linktype
+        from .sensor.select import listen_channels
+
+        if self.disabled:
+            click.echo(f"auto_prepare is off for this run: {self.disabled}", err=True)
+            return False
+        if interface_linktype(interface) is not None:
+            return True
+        if "CAP_NET_ADMIN" not in capability_effective():
+            click.echo(f"sensor {interface} is back in managed mode; run `sudo .venv/bin/daybreak-wids -c CONFIG "
+                       "sensor prepare --apply` (NetworkManager may manage it again after a USB reset; see "
+                       "`sensor check`)", err=True)
+            return False
+        disc = Discovery(self.runner)
+        disc.interfaces()
+        if not self.is_sensor(interface, disc.interface(interface)):
+            click.echo(f"not restoring monitor mode on {interface}: it does not match the configured sensor "
+                       f"({self.cfg.sensor.interface}, MAC {self.cfg.sensor.expected_mac or 'not set'}, "
+                       f"driver {self.cfg.sensor.expected_driver or 'any'})", err=True)
+            return False
+        channels = listen_channels(self.cfg)
+        ctl = SensorController(interface, self.guard, self.runner, nm_running=disc.nm_running,
+                               expected_mac=self.cfg.sensor.expected_mac)
+        report = ctl.prepare(channels[0] if channels else None)
+        if report.protected_changes:
+            self.disabled = f"protected interface changed during recovery: {report.protected_changes}"
+            click.echo(f"auto_prepare stopped: {self.disabled}", err=True)
+            return False
+        if not report.ok:
+            click.echo(f"could not restore monitor mode on {interface}: {report.error}", err=True)
+        return report.ok
 
 
 class _NullStream:
@@ -375,9 +435,12 @@ def _run_monitor(app: App, backend, health, recover, duration: float | None, qui
         stop.set()
 
     old = {s: signal.signal(s, _stop) for s in (signal.SIGINT, signal.SIGTERM)}
-    before = guard.snapshot_protected() if guard is not None and health is not None else None
+    live = guard is not None and health is not None
+    if live:
+        guard.pin()  # these stay protected for the whole run, even if the default route moves
+    before = guard.snapshot_protected() if live else None
     runner = MonitorRunner(rt, backend, health=health, duration=duration, recover=recover, stop=stop,
-                           on_message=lambda m: click.echo(m, err=True))
+                           on_message=lambda m: click.echo(m, err=True), guard=guard if live else None)
     try:
         summary = runner.run()
     finally:
@@ -407,6 +470,8 @@ def monitor_start(app: App, backend_kind, replay, pcap, realtime, speed, duratio
     if app.dry_run:
         click.echo("dry-run: nothing is written to the database, logs or desktop; alerts are printed only.",
                    err=True)
+    if replay is None and pcap is None:
+        click.echo(f"config: {app.config_source()}", err=True)
     backend, health, recover, guard = _build_live(app, backend_kind, replay, pcap, realtime, speed)
     rt, summary = _run_monitor(app, backend, health, recover, duration, quiet, guard=guard)
     st = summary["stats"]
@@ -420,8 +485,8 @@ def monitor_start(app: App, backend_kind, replay, pcap, realtime, speed, duratio
             click.echo(f"  input error: {e}", err=True)
     changes = summary.get("protected_interfaces_changed")
     if changes:
-        click.echo(f"WARNING: protected interface state changed during the run (not by daybreak-wids): {changes}",
-                   err=True)
+        click.echo(f"WARNING: protected interface state changed during the run: {changes} (daybreak-wids sends "
+                   "no commands to protected interfaces)", err=True)
     elif changes == {}:
         click.echo("protected interfaces unchanged", err=True)
 
@@ -718,9 +783,9 @@ def alerts_cmd(app: App, since, min_severity, alert_type, limit, unacked, ack_id
                    f"{r['alert_type']:<36} {r['bssid'] or '':<17}{ack}{sup}")
         if details:
             for line in explain(r["score"], r["reason"].get("components", []))[1:]:
-                click.echo(f"        {line}")
+                click.echo(f"        {printable(line)}")
             if r["summary"]:
-                click.echo(f"        {r['summary']}")
+                click.echo(f"        {printable(r['summary'])}")
 
 
 @main.command("report")

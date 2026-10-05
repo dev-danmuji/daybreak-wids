@@ -26,7 +26,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
-from ..config import Config, KismetConfig
+from ..config import Config, KismetConfig, is_loopback_host
 from ..models import Event, EventType, SecurityProfile, try_normalize_mac
 from .backend import Backend, BackendStatus, BackendUnavailable
 from .discovery import freq_to_channel
@@ -104,6 +104,14 @@ _ZERO_MAC = "00:00:00:00:00:00"
 # ---------------------------------------------------------------------------
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: they would carry the API key cookie / Basic auth header to
+    another URL, outside the endpoint allow-list. A 3xx then surfaces as an HTTP error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002, ANN001
+        return None
+
+
 class KismetClient:
     def __init__(self, url: str, *, api_key: str | None = None, username: str | None = None,
                  password: str | None = None, timeout: float = 5.0):
@@ -112,8 +120,8 @@ class KismetClient:
         self.username = username
         self.password = password
         self.timeout = timeout
-        # Never route localhost Kismet traffic through an HTTP proxy.
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Never route Kismet traffic through an HTTP proxy, and never follow redirects.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirects())
 
     @classmethod
     def from_config(cls, cfg: KismetConfig) -> "KismetClient":
@@ -122,14 +130,17 @@ class KismetClient:
         return cls(cfg.url, api_key=api_key or None, username=cfg.username, password=password,
                    timeout=cfg.timeout)
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json", "User-Agent": "daybreak-wids"}
+    def auth_headers(self) -> dict[str, str]:
+        """Credentials travel in headers only, never in a URL (URLs end up in server/proxy logs)."""
         if self.api_key:
-            headers["Cookie"] = f"KISMET={self.api_key}"
-        elif self.username and self.password is not None:
+            return {"Cookie": f"KISMET={self.api_key}"}
+        if self.username and self.password is not None:
             token = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
-            headers["Authorization"] = f"Basic {token}"
-        return headers
+            return {"Authorization": f"Basic {token}"}
+        return {}
+
+    def _headers(self) -> dict[str, str]:
+        return {"Accept": "application/json", "User-Agent": "daybreak-wids", **self.auth_headers()}
 
     def request(self, path: str, *, fields: list | None = None) -> Any:
         if not any(path.startswith(p.split("{")[0]) for p in ENDPOINTS.values()):
@@ -286,6 +297,20 @@ def kismet_security(crypt: str | None, mfp_required: Any = None, mfp_supported: 
     )
 
 
+KISMET_TEXT_MAX = 512
+
+
+def _scalar_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value)) if isinstance(value, (str, float)) else None
+    except ValueError:
+        return None
+
+
 def alert_to_event(record: Mapping[str, Any], sensor: str) -> Event | None:
     """Kismet alert record -> ``KISMET_ALERT`` event (metadata only)."""
     if not isinstance(record, Mapping):
@@ -305,10 +330,10 @@ def alert_to_event(record: Mapping[str, Any], sensor: str) -> Event | None:
         channel = freq_to_channel(freq)[0]
     md = {
         "kismet_header": str(header),
-        "kismet_text": str(get("text") or ""),
-        "kismet_class": str(get("class") or ""),
-        "kismet_severity": get("severity"),
-        "kismet_hash": get("hash"),
+        "kismet_text": str(get("text") or "")[:KISMET_TEXT_MAX],
+        "kismet_class": str(get("class") or "")[:64],
+        "kismet_severity": _scalar_int(get("severity")),
+        "kismet_hash": _scalar_int(get("hash")),
         "source_backend": "kismet",
     }
     if freq:
@@ -400,26 +425,23 @@ def sensor_datasource(sources: list[DatasourceInfo], interface: str) -> Datasour
 EVENTBUS_TOPICS = ("ALERT", "DATASOURCE_ERROR", "DATASOURCE_CLOSED", "DATASOURCE_OPENED")
 
 
-def eventbus_url(base: str, api_key: str | None, username: str | None, password: str | None) -> str:
+def eventbus_url(base: str) -> str:
+    """Eventbus websocket URL (no credentials: they are sent as headers, see EventbusReader)."""
     parts = urllib.parse.urlsplit(base)
     scheme = "wss" if parts.scheme == "https" else "ws"
-    query = {}
-    if api_key:
-        query["KISMET"] = api_key
-    elif username and password is not None:
-        query.update(user=username, password=password)
-    return urllib.parse.urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + "/eventbus/events.ws",
-                                    urllib.parse.urlencode(query), ""))
+    return urllib.parse.urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + "/eventbus/events.ws", "", ""))
 
 
 class EventbusReader(threading.Thread):
     """Background reader that pushes decoded eventbus messages into a queue."""
 
     def __init__(self, url: str, out: "queue.Queue[dict]", *,
-                 connect: Callable[[str], Any] | None = None, reconnect_delay: float = 5.0):
+                 connect: Callable[[str], Any] | None = None, reconnect_delay: float = 5.0,
+                 headers: dict[str, str] | None = None):
         super().__init__(name="kismet-eventbus", daemon=True)
         self.url = url
         self.out = out
+        self.headers = dict(headers or {})
         self._connect = connect
         self.reconnect_delay = reconnect_delay
         self._stop = threading.Event()
@@ -439,7 +461,9 @@ class EventbusReader(threading.Thread):
         if self._connect is not None:
             return self._connect(self.url)
         import websocket
-        return websocket.create_connection(self.url, timeout=10)
+        # Credentials as headers; like the REST client, never through an environment proxy.
+        return websocket.create_connection(self.url, timeout=10, http_no_proxy=["*"],
+                                           header=[f"{k}: {v}" for k, v in self.headers.items()])
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -526,9 +550,8 @@ class KismetBackend(Backend):
         self._healthy = True
         self._refresh_datasources()
         if self.cfg.use_eventbus and (self.eventbus_connect or EventbusReader.available()):
-            url = eventbus_url(self.client.base, self.client.api_key, self.client.username,
-                               self.client.password)
-            self.eventbus = EventbusReader(url, self._queue, connect=self.eventbus_connect)
+            self.eventbus = EventbusReader(eventbus_url(self.client.base), self._queue,
+                                           connect=self.eventbus_connect, headers=self.client.auth_headers())
             self.eventbus.start()
         if self.cfg.frame_tap and self.frame_tap_factory is not None:
             self._open_frame_tap()
@@ -665,6 +688,10 @@ def check_kismet(client: KismetClient, cfg: Config) -> list[tuple[str, str, str]
     except KismetError as exc:
         return [("fail", "reachable", str(exc))]
     out.append(("ok", "reachable", f"Kismet {status.get('kismet.system.version', '?')} at {client.base}"))
+    parts = urllib.parse.urlsplit(client.base)
+    if parts.scheme == "http" and client.auth_headers() and not is_loopback_host(parts.hostname or ""):
+        out.append(("warn", "transport", "credentials are sent unencrypted over http to a non-loopback "
+                                         "host; use https, or run Kismet on this machine"))
 
     try:
         sources = [DatasourceInfo.from_record(r) for r in client.datasources()]

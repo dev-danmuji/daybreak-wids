@@ -116,3 +116,62 @@ def test_network_sync_is_upsert(tmp_path, config):
     assert first == second
     statuses = {n["name"]: n["status"] for n in db.list_networks()}
     assert statuses == {"home": "configured", "lab": "unconfigured"}
+
+
+def test_prune_applies_retention_to_all_personal_data(tmp_path):
+    from daybreak.models import EventType
+
+    db = Database(tmp_path / "p.db")
+    old, new, cutoff = 1_000_000.0, 2_000_000.0, 1_500_000.0
+    for n, ts in enumerate((old, new)):
+        db.insert_event(Event(ts, EventType.DEAUTH, bssid="AA:BB:CC:DD:EE:FF", source="AA:BB:CC:DD:EE:FF",
+                              destination=f"10:22:33:44:55:0{n}"))
+        db.upsert_station(mac=f"10:22:33:44:55:0{n}", bssid="AA:BB:CC:DD:EE:FF", network_id=None, timestamp=ts)
+        db.upsert_ap(bssid=f"02:00:00:00:00:0{n}", ssid="ExampleSSID", network_id=None, authorized=False,
+                     channel=36, security=None, phy=None, rssi=-60, timestamp=ts)
+        db.insert_alert(Alert("DEAUTH_BURST", ts, 30, [ScoreComponent(30, "deauth burst", "x")], summary="s"))
+        db.record_sensor_status(sensor="s", interface="i", status="ONLINE", backend="passive", timestamp=ts)
+    removed = db.prune(older_than=cutoff)
+    assert removed == {"events": 1, "alerts": 1, "sensor_status": 1, "stations": 1, "aps": 1}
+    assert len(db.query_events()) == 1 and len(db.list_alerts(limit=None)) == 1
+    assert [s["mac"] for s in db.list_stations()] == ["10:22:33:44:55:01"]
+    assert [a["bssid"] for a in db.list_aps()] == ["02:00:00:00:00:01"]
+    db.close()
+
+
+def test_event_buckets_are_counted_in_sql(tmp_path):
+    from daybreak.models import EventType
+
+    db = Database(tmp_path / "b.db")
+    start = 1_790_000_000.0
+    db.insert_events([Event(start + i * 10, EventType.DEAUTH, bssid="AA:BB:CC:DD:EE:FF") for i in range(13)]
+                     + [Event(start + 65, EventType.EAPOL, bssid="AA:BB:CC:DD:EE:FF")])
+    buckets = db.event_buckets(since=start, until=start + 180, bucket=60, event_types=["deauth", "eapol"])
+    assert buckets == {0: {"deauth": 6}, 1: {"deauth": 6, "eapol": 1}, 2: {"deauth": 1}}
+    assert db.event_buckets(since=start, until=start + 180, bucket=60, event_types=["auth"]) == {}
+    db.close()
+
+
+def test_readonly_open_never_writes_and_survives_unwritable_dir(tmp_path):
+    import os
+
+    from daybreak.models import EventType
+
+    odd = tmp_path / "dir #1 %41?x"   # characters that change the meaning of a sqlite URI
+    odd.mkdir()
+    path = odd / "x.db"
+    db = Database(path)
+    db.insert_event(Event(1_790_000_000.0, EventType.DEAUTH, bssid="AA:BB:CC:DD:EE:FF"))
+    db.close()
+    os.chmod(odd, 0o555)   # like var/ written by a root-run monitor that has stopped
+    try:
+        ro = Database(path, readonly=True)
+        assert ro.event_counts(since=0) == {"deauth": 1}
+        with pytest.raises(sqlite3.OperationalError):
+            ro.conn.execute("DELETE FROM events")
+        ro.close()
+    finally:
+        os.chmod(odd, 0o755)
+    assert sorted(p.name for p in tmp_path.iterdir()) == [odd.name]  # nothing created next to it
+    with pytest.raises(sqlite3.Error):
+        Database(tmp_path / "missing.db", readonly=True)

@@ -7,14 +7,16 @@ import ipaddress
 import os
 import types
 import typing
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 import yaml
 
+from .fileperm import write_private_atomic
 from .models import PMF_LEVELS, Severity, normalize_mac
-from .safety import SafetyViolation, enforce_passive
+from .safety import SafetyViolation, enforce_passive, valid_ifname
 
 DEFAULT_SENSOR_INTERFACE = "wlx00c0cab85c32"
 DEFAULT_PROTECTED_INTERFACES = ("wlo1",)
@@ -191,6 +193,7 @@ DEFAULT_WEIGHTS: dict[str, int] = {
     "concurrent_deauth": 15,
     "kismet_other": 10,
     "sensor_lost": 50,
+    "protected_interface_changed": 50,
 }
 
 
@@ -246,6 +249,8 @@ class DashboardConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     allow_remote: bool = False
+    # Extra Host-header names accepted with allow_remote (the names/addresses typed in the browser).
+    allowed_hosts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -404,10 +409,46 @@ def validate_network(net: ProtectedNetwork, where: str) -> None:
         net.security.pmf = pmf
 
 
+def _validate_kismet_url(url: str) -> None:
+    """http(s)://host[:port][/path] only. The URL ends up in error messages and status files,
+    so it must never carry credentials (the messages below never echo it)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        parts.port  # noqa: B018 - raises ValueError for an invalid port
+    except ValueError as exc:
+        raise ConfigError("backend.kismet.url is not a valid URL") from exc
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ConfigError("backend.kismet.url must be an http(s) URL with a host, e.g. http://127.0.0.1:2501")
+    if "@" in parts.netloc or parts.query or parts.fragment or "@" in parts.path:
+        raise ConfigError("backend.kismet.url must not contain credentials, a query or a fragment; use "
+                          "backend.kismet.api_key_env (or username + password_env)")
+
+
+def is_loopback_host(host: str) -> bool:
+    """True for localhost and loopback addresses (IPv6 with or without brackets)."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
 def _validate(cfg: Config) -> None:
     enforce_passive(cfg.safety)
     if not cfg.sensor.interface:
         raise ConfigError("sensor.interface must be set")
+    names = [("sensor.interface", cfg.sensor.interface), ("backend.passive.interface", cfg.backend.passive.interface)]
+    names += [(f"sensor.protected_interfaces[{i}]", n) for i, n in enumerate(cfg.sensor.protected_interfaces)]
+    for where, name in names:
+        if name is not None and not valid_ifname(name):
+            raise ConfigError(f"{where}: {name!r} is not a valid interface name")
+    for ch in cfg.sensor.channels:
+        if not 1 <= ch <= 233:
+            raise ConfigError(f"sensor.channels: invalid channel {ch}")
+    for key in ("dwell_time", "health_check_interval"):
+        if getattr(cfg.sensor, key) <= 0:
+            raise ConfigError(f"sensor.{key} must be positive")
     if cfg.sensor.interface in cfg.sensor.protected_interfaces:
         raise ConfigError(
             f"sensor.interface {cfg.sensor.interface!r} is listed in sensor.protected_interfaces; "
@@ -444,12 +485,14 @@ def _validate(cfg: Config) -> None:
             raise ConfigError(f"unknown scoring weight: {key} (known: {', '.join(sorted(DEFAULT_WEIGHTS))})")
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
             raise ConfigError(f"scoring.weights.{key} must be an integer 0-100")
-    try:
-        is_loopback = ipaddress.ip_address(cfg.dashboard.host).is_loopback
-    except ValueError:
-        is_loopback = cfg.dashboard.host == "localhost"
-    if not is_loopback and not cfg.dashboard.allow_remote:
+    if cfg.storage.retention_days < 0:
+        raise ConfigError("storage.retention_days must be >= 0 (0 keeps data forever)")
+    _validate_kismet_url(cfg.backend.kismet.url)
+    if not is_loopback_host(cfg.dashboard.host) and not cfg.dashboard.allow_remote:
         raise ConfigError("dashboard.host must be a loopback address unless dashboard.allow_remote is true")
+    for host in cfg.dashboard.allowed_hosts:
+        if not isinstance(host, str) or not host.strip() or any(c in host for c in " /@"):
+            raise ConfigError(f"dashboard.allowed_hosts: invalid host name {host!r}")
     names = [n.name for n in cfg.protected_networks]
     dupes = {n for n in names if names.count(n) > 1}
     if dupes:
@@ -513,13 +556,10 @@ def load_registry_file(path: Path) -> list[ProtectedNetwork]:
 
 
 def save_registry_file(path: Path, networks: list[ProtectedNetwork]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     doc = {"protected_networks": [n.to_yaml_dict() for n in networks if n.origin == "registry"]}
     header = ("# Managed by `daybreak-wids network add/remove`.\n"
               "# Networks defined in config.yaml are not listed here.\n")
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(header + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), encoding="utf-8")
-    tmp.replace(path)
+    write_private_atomic(path, header + yaml.safe_dump(doc, sort_keys=False, allow_unicode=True))
 
 
 def load_config(path: str | Path | None = None) -> Config:

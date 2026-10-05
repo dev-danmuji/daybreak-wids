@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Callable
 
-from daybreak.safety import CommandResult, CommandRunner
+from daybreak.safety import CommandResult, CommandRunner, checked_command
 
 HOST = Path(__file__).parent / "fixtures" / "host"
 
@@ -84,6 +84,7 @@ class FakeRunner(CommandRunner):
 
     def run(self, argv, *, mutating: bool = False) -> CommandResult:
         argv = list(argv)
+        mutating = checked_command(argv, mutating)  # the runtime allow-list applies to every test
         self.history.append(argv)
         if mutating:
             if self.dry_run:

@@ -73,9 +73,10 @@ function renderStatus(s) {
     el("dt", {}, "Disassoc"), el("dd", {}, l5.disassoc || 0),
     el("dt", {}, "EAPOL"), el("dd", {}, l5.eapol || 0),
     el("dt", {}, "(Re)connect"), el("dd", {}, connects));
-  const line = mon
+  let line = mon
     ? `monitor ${mon.alive ? "running" : (mon.state || "stopped")}, last event ${mon.last_event || "-"}`
     : "monitor never started";
+  if (s.database === "unreadable") line += " - database not readable by the dashboard process";
   document.getElementById("monitor-line").textContent = line;
 }
 
@@ -95,6 +96,10 @@ function securityPills(n) {
   return pills;
 }
 
+function unknownCount(n) {
+  return n.unknown_bssid_count ?? (n.unknown_bssids || []).length;
+}
+
 function renderNetworks(nets) {
   if (!nets.length) {
     replace("networks", el("div", { class: "muted" }, "No protected networks configured."));
@@ -103,7 +108,7 @@ function renderNetworks(nets) {
   replace("networks", ...nets.map((n) => el("div", { class: "net" },
     el("div", { class: "ssid" }, n.ssid),
     el("div", { class: "muted" }, `${n.network} - ${n.status}` +
-      (n.unknown_bssids && n.unknown_bssids.length ? ` - ${n.unknown_bssids.length} unregistered BSSID(s)` : "")),
+      (unknownCount(n) ? ` - ${unknownCount(n)} unregistered BSSID(s)` : "")),
     el("div", {}, ...securityPills(n)))));
 
   replace("security", ...nets.map((n) => {
@@ -121,8 +126,8 @@ function renderNetworks(nets) {
   }));
 }
 
-function renderAlerts(alerts) {
-  document.getElementById("alerts-note").textContent = `(last 24 h, ${alerts.length})`;
+function renderAlerts(alerts, period) {
+  document.getElementById("alerts-note").textContent = `(${period}, ${alerts.length})`;
   if (!alerts.length) {
     replace("alerts", el("tr", {}, el("td", { colspan: "6", class: "muted" }, "No alerts.")));
     return;
@@ -212,18 +217,38 @@ function renderBaseline(rows) {
   }));
 }
 
+async function refreshAlertsAndTimeline() {
+  const t = await getJSON("/api/timeline?minutes=60");
+  renderTimeline(t);
+  let alerts = await getJSON("/api/alerts?hours=24&limit=100");
+  let period = "last 24 h";
+  const recorded = t.anchor && t.anchor < Date.now() / 1000 - 120;
+  if (!alerts.length && recorded) {
+    // No live data: like the timeline, show the most recent recorded period (e.g. a replay).
+    alerts = await getJSON(`/api/alerts?hours=24&limit=100&until=${encodeURIComponent(t.anchor)}`);
+    period = `recorded data, 24 h up to ${fmtTime(t.anchor)}`;
+  }
+  renderAlerts(alerts, period);
+}
+
 async function refresh() {
   const jobs = [
     ["/api/status", renderStatus],
     ["/api/networks", renderNetworks],
-    ["/api/alerts?hours=24&limit=100", renderAlerts],
-    ["/api/timeline?minutes=60", renderTimeline],
     ["/api/baseline", renderBaseline],
   ];
-  await Promise.all(jobs.map(async ([path, fn]) => {
-    try { fn(await getJSON(path)); } catch (e) { console.warn(e); }
-  }));
+  await Promise.all([
+    ...jobs.map(async ([path, fn]) => {
+      try { fn(await getJSON(path)); } catch (e) { console.warn(e); }
+    }),
+    refreshAlertsAndTimeline().catch((e) => console.warn(e)),
+  ]);
 }
 
-refresh();
-setInterval(refresh, 5000);
+// Poll every 5 s, but never start a refresh while the previous one is still running.
+async function loop() {
+  await refresh();
+  setTimeout(loop, 5000);
+}
+
+loop();

@@ -142,7 +142,25 @@ def assess_profile(p: SecurityProfile) -> tuple[list[AuditItem], list[str]]:
     return items, recs
 
 
-def audit_network(net: ProtectedNetwork, observations: Iterable[APObservation]) -> NetworkAudit:
+# Unregistered BSSIDs listed by name; a beacon flood with random BSSIDs must not produce
+# thousands of lines.
+MAX_LISTED = 20
+
+
+def _listed(obs: list[APObservation], total: int | None = None) -> str:
+    """The ``MAX_LISTED`` most recently seen BSSIDs (sorted), then ``(+N more)``.
+
+    ``total`` is the real number of unregistered BSSIDs when ``obs`` is a capped subset.
+    """
+    recent = sorted(obs, key=lambda a: -(a.last_seen or 0))[:MAX_LISTED]
+    shown = ", ".join(sorted(a.bssid for a in recent))
+    total = max(total or 0, len(obs))
+    return shown if total <= len(recent) else f"{shown} (+{total - len(recent)} more)"
+
+
+def audit_network(net: ProtectedNetwork, observations: Iterable[APObservation], *,
+                  unknown_total: int | None = None) -> NetworkAudit:
+    """``unknown_total``: number of unregistered BSSIDs when ``observations`` is a capped subset."""
     obs = list(observations)
     audit = NetworkAudit(network=net.name, ssid=net.ssid, status=net.status)
     if net.configured:
@@ -153,10 +171,14 @@ def audit_network(net: ProtectedNetwork, observations: Iterable[APObservation]) 
     if not net.configured:
         audit.items.append(AuditItem(INFO, "unconfigured",
                                      "no BSSID registered; observed BSSIDs are listed as candidates only"))
+    elif audit.unknown:  # also when the registered AP itself has not been heard (yet)
+        audit.items.append(AuditItem(WARN, "unregistered BSSIDs advertise this SSID",
+                                     _listed(audit.unknown, unknown_total)))
     if not audit.aps:
         if net.configured:
             audit.items.append(AuditItem(INFO, "not observed",
                                          "no beacon from a registered BSSID has been recorded yet"))
+        audit.items.sort(key=lambda i: _ORDER[i.level])
         return audit
     seen_titles: set[str] = set()
     for ap in audit.aps:
@@ -181,9 +203,6 @@ def audit_network(net: ProtectedNetwork, observations: Iterable[APObservation]) 
         if prof is not None and not set(net.security.expected) >= set(prof.protocols) - {"OWE"}:
             audit.items.append(AuditItem(WARN, "differs from registry expectation",
                                          f"advertised {prof.mode}, expected {'/'.join(net.security.expected)}"))
-    if audit.unknown:
-        audit.items.append(AuditItem(WARN, "unregistered BSSIDs advertise this SSID",
-                                     ", ".join(sorted(o.bssid for o in audit.unknown))))
     audit.items.sort(key=lambda i: _ORDER[i.level])
     return audit
 
@@ -223,9 +242,12 @@ def render_audit(audit: NetworkAudit) -> str:
     if audit.unknown:
         label = "Candidates (unregistered)" if audit.status == "unconfigured" else "Unregistered BSSIDs"
         lines.append(f"{label}:")
-        for ap in audit.unknown:
+        recent = sorted(audit.unknown, key=lambda a: -(a.last_seen or 0))[:MAX_LISTED]
+        for ap in sorted(recent, key=lambda a: a.bssid):  # the same BSSIDs as the findings line
             mode = ap.profile.mode if ap.profile else "?"
             lines.append(f"  {ap.bssid}  ch {ap.channel or '?':>3}  {mode}")
+        if len(audit.unknown) > MAX_LISTED:
+            lines.append(f"  ... and {len(audit.unknown) - MAX_LISTED} more (most recently seen shown)")
     if audit.items:
         lines += ["", "Findings:"]
         for item in audit.items:

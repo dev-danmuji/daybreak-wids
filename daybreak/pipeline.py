@@ -70,6 +70,19 @@ def sensor_alert(status: str, ts: float, *, sensor: str, interface: str | None,
     return Alert(status, ts, score, comps, summary=summary, sensor=sensor, details=details)
 
 
+PROTECTED_INTERFACE_CHANGED = "PROTECTED_INTERFACE_CHANGED"
+
+
+def protected_alert(ts: float, changes: dict[str, list[str]], *, sensor: str, weight: int = 50) -> Alert:
+    """A protected interface (the internet link) changed state during a live run."""
+    detail = "; ".join(f"{name}: {', '.join(diff)}" for name, diff in sorted(changes.items()))
+    comps = [ScoreComponent(weight, "protected interface changed", detail, "protected_interface_changed")]
+    summary = ("A protected interface changed state while monitoring. daybreak-wids sends no commands to "
+               "protected interfaces; automatic sensor re-preparation is disabled for this run.")
+    return Alert(PROTECTED_INTERFACE_CHANGED, ts, weight, comps, summary=summary, sensor=sensor,
+                 details={"changes": changes})
+
+
 class Pipeline:
     def __init__(self, config: Config, *, db: Any = None, sink: Callable[[Alert], Any] | None = None,
                  baseline: Any = None, extra_detectors: list[Any] | None = None):
