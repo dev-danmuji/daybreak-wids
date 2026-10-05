@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import queue
 import re
 import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -27,7 +29,9 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from ..config import Config, KismetConfig, is_loopback_host
-from ..models import Event, EventType, SecurityProfile, try_normalize_mac
+from ..models import (
+    Event, EventType, SecurityProfile, clean_text, kismet_header_name, plausible_timestamp, try_normalize_mac,
+)
 from .backend import Backend, BackendStatus, BackendUnavailable
 from .discovery import freq_to_channel
 
@@ -221,6 +225,10 @@ class KismetClient:
         return sec + usec / 1e6 if sec else None
 
 
+def _text(value: Any) -> str:
+    return clean_text(value) if isinstance(value, str) else ""
+
+
 def _as_float(value: Any) -> float | None:
     try:
         return float(value) if value is not None else None
@@ -247,9 +255,10 @@ def parse_kismet_channel(value: Any) -> int | None:
 
 def _freq_mhz(value: Any) -> int | None:
     f = _as_float(value)
-    if not f:
+    if not f or not math.isfinite(f):
         return None
-    return int(f / 1000) if f > 100000 else int(f)
+    mhz = int(f / 1000) if f > 100000 else int(f)
+    return mhz if 1000 <= mhz <= 100000 else None
 
 
 _AKM_SUFFIX = [
@@ -324,10 +333,10 @@ def alert_to_event(record: Mapping[str, Any], sensor: str) -> Event | None:
     if not isinstance(record, Mapping):
         return None
     get = lambda key: record.get(ALERT_FIELDS[key])  # noqa: E731
-    header = get("header")
+    header = kismet_header_name(get("header"))
     ts = _as_float(get("timestamp"))
-    if not header or not ts:
-        return None
+    if not header or ts is None or not plausible_timestamp(ts):
+        return None  # an implausible time would also break the next alerts_since request
     macs = {}
     for key in ("bssid", "source", "dest", "other"):
         mac = try_normalize_mac(get(key))
@@ -337,9 +346,9 @@ def alert_to_event(record: Mapping[str, Any], sensor: str) -> Event | None:
     if channel is None and freq:
         channel = freq_to_channel(freq)[0]
     md = {
-        "kismet_header": str(header),
-        "kismet_text": str(get("text") or "")[:KISMET_TEXT_MAX],
-        "kismet_class": str(get("class") or "")[:64],
+        "kismet_header": header,
+        "kismet_text": _text(get("text"))[:KISMET_TEXT_MAX],   # strings only: never a str() of an object
+        "kismet_class": _text(get("class"))[:64],
         "kismet_severity": _scalar_int(get("severity")),
         "kismet_hash": _scalar_int(get("hash")),
         "source_backend": "kismet",
@@ -369,7 +378,9 @@ def device_to_event(record: Mapping[str, Any], sensor: str, now: float) -> Event
         channel = freq_to_channel(freq)[0]
     signal = record.get("signal")
     rssi = int(signal) if isinstance(signal, (int, float)) and -127 <= signal < 0 else None
-    ts = _as_float(record.get("last_time")) or now
+    ts = _as_float(record.get("last_time"))
+    if ts is None or not plausible_timestamp(ts):
+        ts = now
     md: dict[str, Any] = {"source_backend": "kismet"}
     if isinstance(record.get("num_clients"), int):
         md["num_clients"] = record["num_clients"]
@@ -377,7 +388,7 @@ def device_to_event(record: Mapping[str, Any], sensor: str, now: float) -> Event
         md["frequency"] = freq
     return Event(
         timestamp=ts, event_type=EventType.BEACON, sensor=sensor, bssid=mac, source=mac,
-        channel=channel, rssi=rssi, ssid=ssid[:32],
+        channel=channel, rssi=rssi, ssid=clean_text(ssid[:32]),
         security=kismet_security(record.get("crypt_string"), record.get("mfp_required"),
                                  record.get("mfp_supported"), record.get("wps_state")),
         metadata=md,
@@ -414,7 +425,7 @@ class DatasourceInfo:
             error_reason=str(r.get("kismet.datasource.error_reason", "") or ""),
             channel=str(r.get("kismet.datasource.channel", "") or ""),
             hopping=bool(r.get("kismet.datasource.hopping", False)),
-            packets=int(r.get("kismet.datasource.num_packets", 0) or 0),
+            packets=_scalar_int(r.get("kismet.datasource.num_packets")) or 0,
         )
 
     def matches(self, interface: str) -> bool:
@@ -438,6 +449,20 @@ def eventbus_url(base: str) -> str:
     parts = urllib.parse.urlsplit(base)
     scheme = "wss" if parts.scheme == "https" else "ws"
     return urllib.parse.urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + "/eventbus/events.ws", "", ""))
+
+
+def _open_socket(url: str, *, timeout: float) -> socket.socket:
+    """Direct TCP (TLS for wss, certificate verified) connection to the eventbus host; no proxy."""
+    parts = urllib.parse.urlsplit(url)
+    secure = parts.scheme == "wss"
+    sock = socket.create_connection((parts.hostname, parts.port or (443 if secure else 80)), timeout=timeout)
+    if not secure:
+        return sock
+    try:
+        return ssl.create_default_context().wrap_socket(sock, server_hostname=parts.hostname)
+    except BaseException:
+        sock.close()
+        raise
 
 
 class EventbusReader(threading.Thread):
@@ -469,10 +494,16 @@ class EventbusReader(threading.Thread):
         if self._connect is not None:
             return self._connect(self.url)
         import websocket
-        # Credentials as headers; like the REST client, never through an environment proxy and
-        # never to a redirect target (websocket-client would resend the headers there).
-        return websocket.create_connection(self.url, timeout=10, http_no_proxy=["*"], redirect_limit=0,
-                                           header=[f"{k}: {v}" for k, v in self.headers.items()])
+        # Credentials as headers, over a connection opened here: websocket-client would use an
+        # environment proxy (its http_no_proxy option only applies together with an explicit
+        # proxy host) and would resend the headers to a redirect target (redirect_limit=0).
+        sock = _open_socket(self.url, timeout=10)
+        try:
+            return websocket.create_connection(self.url, timeout=10, socket=sock, redirect_limit=0,
+                                               header=[f"{k}: {v}" for k, v in self.headers.items()])
+        except BaseException:
+            sock.close()
+            raise
 
     def run(self) -> None:
         while not self._stop.is_set():
@@ -552,7 +583,9 @@ class KismetBackend(Backend):
         except KismetError as exc:
             raise BackendUnavailable(str(exc)) from exc
         self.version = str(status.get("kismet.system.version", "")) or None
-        server = self.client.server_time(status) or self.clock()
+        server = self.client.server_time(status)
+        if server is None or not plausible_timestamp(server):
+            server = self.clock()
         self.offset = server - self.clock()
         self.last_alert_ts = server
         self.last_device_ts = server - 60.0  # initial AP security snapshot

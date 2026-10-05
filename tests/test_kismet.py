@@ -1,6 +1,7 @@
 import json
 import queue
 import socket
+import threading
 import time
 
 import pytest
@@ -258,43 +259,72 @@ def test_eventbus_url_carries_no_credentials():
     assert KismetClient("http://x", username="u", password="p").auth_headers() == {"Authorization": "Basic dTpw"}
 
 
-def test_eventbus_sends_credentials_as_headers_without_proxy(monkeypatch):
+def _listener():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    srv.settimeout(5)
+    return srv
+
+
+def test_eventbus_uses_no_proxy_and_never_follows_a_redirect(monkeypatch):
     websocket = pytest.importorskip("websocket")
+    kismet_srv, proxy_srv, target_srv = _listener(), _listener(), _listener()
+    got = {}
+
+    def answer_with_a_redirect():  # like a reverse proxy / SSO in front of Kismet
+        try:
+            conn, _ = kismet_srv.accept()
+        except OSError:
+            return
+        with conn:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            got["request"] = data.decode("latin-1")
+            conn.sendall(f"HTTP/1.1 302 Found\r\nLocation: ws://127.0.0.1:{target_srv.getsockname()[1]}/steal\r\n"
+                         "Content-Length: 0\r\n\r\n".encode())
+
+    server = threading.Thread(target=answer_with_a_redirect, daemon=True)
+    server.start()
+    for var in ("http_proxy", "HTTP_PROXY"):
+        monkeypatch.setenv(var, f"http://127.0.0.1:{proxy_srv.getsockname()[1]}")
+    for var in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(var, raising=False)
+    url = eventbus_url(f"http://127.0.0.1:{kismet_srv.getsockname()[1]}")
+    reader = EventbusReader(url, queue.Queue(), headers={"Cookie": "KISMET=k"})
+    try:
+        with pytest.raises(websocket.WebSocketException, match="[Rr]edirect"):
+            reader._open()
+        server.join(5)
+        request_line, _, headers = got["request"].partition("\r\n")
+        assert "Cookie: KISMET=k" in headers and "KISMET" not in request_line  # header only, never the URL
+        for srv in (proxy_srv, target_srv):  # nothing reached the environment proxy or the redirect target
+            srv.settimeout(0.2)
+            with pytest.raises(OSError):
+                srv.accept()
+    finally:
+        for srv in (kismet_srv, proxy_srv, target_srv):
+            srv.close()
+
+
+def test_eventbus_tls_is_verified_against_the_kismet_host(monkeypatch):
+    import daybreak.sensor.kismet as kismet_mod
+
     seen = {}
 
-    def fake_create_connection(url, **kw):
-        seen.update(url=url, **kw)
-        raise ConnectionError("stop")
+    class Ctx:
+        def wrap_socket(self, sock, server_hostname):
+            seen["sni"] = server_hostname
+            return sock
 
-    monkeypatch.setattr(websocket, "create_connection", fake_create_connection)
-    reader = EventbusReader(eventbus_url("http://127.0.0.1:2501"), queue.Queue(), headers={"Cookie": "KISMET=k"})
-    with pytest.raises(ConnectionError):
-        reader._open()
-    assert "KISMET" not in seen["url"] and seen["header"] == ["Cookie: KISMET=k"]
-    assert seen["http_no_proxy"] == ["*"]
-
-
-def test_eventbus_never_follows_a_redirect(monkeypatch):
-    websocket = pytest.importorskip("websocket")
-    core = pytest.importorskip("websocket._core")
-    from websocket._handshake import handshake_response
-
-    class Sock:
-        def close(self):
-            pass
-
-    handshakes = []
-
-    def fake_handshake(sock, url, *addrs, **options):  # no socket: the library's own redirect loop runs
-        handshakes.append((url, options.get("header")))
-        return handshake_response(302, {"location": "ws://attacker.example/eventbus/events.ws"}, None)
-
-    monkeypatch.setattr(core, "connect", lambda url, *a, **k: (Sock(), ("127.0.0.1", 2501, "/eventbus/events.ws")))
-    monkeypatch.setattr(core, "handshake", fake_handshake)
-    reader = EventbusReader(eventbus_url("http://127.0.0.1:2501"), queue.Queue(), headers={"Cookie": "KISMET=k"})
-    with pytest.raises(websocket.WebSocketException, match="[Rr]edirect"):
-        reader._open()
-    assert len(handshakes) == 1 and handshakes[0][0].startswith("ws://127.0.0.1:2501/")
+    monkeypatch.setattr(kismet_mod.socket, "create_connection", lambda addr, timeout: seen.update(addr=addr) or object())
+    monkeypatch.setattr(kismet_mod.ssl, "create_default_context", lambda: Ctx())
+    kismet_mod._open_socket("wss://kismet.lan/eventbus/events.ws", timeout=1)
+    assert seen == {"addr": ("kismet.lan", 443), "sni": "kismet.lan"}
 
 
 def test_client_refuses_redirects(kismet):

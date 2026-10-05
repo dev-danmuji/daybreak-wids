@@ -84,6 +84,16 @@ def is_locally_administered(mac: str | None) -> bool:
 # Upper bound for event timestamps (2100-01-01): later values come from broken or crafted
 # input and would break date formatting and time-bucketed statistics.
 MAX_EVENT_TS = 4_102_444_800.0
+_KISMET_HEADER = re.compile(r"[A-Z0-9_]{1,64}")
+
+
+def kismet_header_name(value: Any) -> str | None:
+    """A Kismet alert header as used in alert types (``KISMET_<header>``): an identifier of at
+    most 64 characters; anything else from Kismet or a replay file becomes ``OTHER``."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    name = value.strip().upper()
+    return name if _KISMET_HEADER.fullmatch(name) else "OTHER"
 
 
 def plausible_timestamp(ts: float) -> bool:
@@ -361,13 +371,16 @@ class SecurityProfile:
         if not isinstance(data, Mapping):
             raise ValueError("security must be an object")
 
+        def _name(value: Any) -> str:  # AKM / cipher names: short, encodable text
+            return clean_text(str(value))[:64].upper()
+
         def _tuple(key: str) -> tuple[str, ...]:
             value = data.get(key) or ()
             if isinstance(value, str):
                 value = [value]
             if not isinstance(value, (list, tuple)):
                 raise ValueError(f"security.{key} must be a list")
-            return tuple(str(v).upper() for v in value)
+            return tuple(_name(v) for v in value[:32])
 
         def _opt_bool(key: str) -> bool | None:
             value = data.get(key)
@@ -390,13 +403,13 @@ class SecurityProfile:
             wpa1=bool(data.get("wpa1", False)),
             akms=akms,
             pairwise_ciphers=_tuple("pairwise_ciphers"),
-            group_cipher=(str(data["group_cipher"]).upper() if data.get("group_cipher") else None),
-            group_mgmt_cipher=(str(data["group_mgmt_cipher"]).upper() if data.get("group_mgmt_cipher") else None),
+            group_cipher=(_name(data["group_cipher"]) if data.get("group_cipher") else None),
+            group_mgmt_cipher=(_name(data["group_mgmt_cipher"]) if data.get("group_mgmt_cipher") else None),
             mfp_capable=mfp_capable or mfp_required,
             mfp_required=mfp_required,
             sae_h2e=_opt_bool("sae_h2e"),
             wps=_opt_bool("wps"),
-            source=str(data.get("source", "ie")),
+            source=clean_text(str(data.get("source", "ie")))[:32],
         )
 
 

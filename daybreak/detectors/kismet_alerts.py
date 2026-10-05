@@ -6,7 +6,7 @@ category, so the correlator counts the phenomenon once and cites both sources.
 
 from __future__ import annotations
 
-from ..models import Event, EventType, Finding
+from ..models import Event, EventType, Finding, kismet_header_name
 from .base import DetectionContext, finding
 
 # header -> (category / weight key, label)
@@ -30,7 +30,7 @@ class KismetAlertDetector:
     def process(self, ev: Event, ctx: DetectionContext) -> list[Finding]:
         if ev.event_type is not EventType.KISMET_ALERT:
             return []
-        header = str(ev.metadata.get("kismet_header", "")).upper()
+        header = kismet_header_name(ev.metadata.get("kismet_header"))  # replay files are untrusted too
         if not header:
             return []
         text = str(ev.metadata.get("kismet_text", ""))
