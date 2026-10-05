@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from ..fileperm import private_dir, secure_path
-from ..models import Alert, Event, EventType, Severity, sanitize_metadata
+from ..models import Alert, Event, EventType, Severity, clean_text, sanitize_metadata
 from .migrations import migrate
 
 
@@ -146,7 +146,7 @@ class Database:
         if event.ssid:
             md["ssid"] = event.ssid
         return (
-            event.timestamp, event.sensor or "", event.event_type.value, event.bssid,
+            event.timestamp, clean_text(event.sensor or ""), event.event_type.value, event.bssid,
             event.station, event.source, event.destination, event.channel, event.rssi,
             event.reason_code, _dumps(md),
         )
@@ -265,7 +265,7 @@ class Database:
                    rssi_last=COALESCE(excluded.rssi_last, aps.rssi_last),
                    observations=aps.observations + 1,
                    last_seen=MAX(aps.last_seen, excluded.last_seen)""",
-            (bssid, ssid or "", network_id, None if authorized is None else int(authorized), channel,
+            (bssid, clean_text(ssid or ""), network_id, None if authorized is None else int(authorized), channel,
              security.mode if security is not None else None,
              security.pmf if security is not None else None,
              sec_json, _dumps(dict(phy)) if phy else None, rssi, timestamp, timestamp),
@@ -339,8 +339,8 @@ class Database:
                    acknowledged, bssid, summary, sensor, suppressed_count, last_seen)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (alert.timestamp, alert.severity.name, alert.alert_type, alert.network_id, alert.score,
-             _dumps(alert.reason_dict()), int(alert.acknowledged), alert.bssid, alert.summary,
-             alert.sensor, alert.suppressed_count, alert.timestamp),
+             _dumps(alert.reason_dict()), int(alert.acknowledged), alert.bssid, clean_text(alert.summary or ""),
+             clean_text(alert.sensor or ""), alert.suppressed_count, alert.timestamp),
         )
         alert.id = int(cur.lastrowid)
         return alert.id
@@ -438,7 +438,8 @@ class Database:
         cur = self._execute(
             """INSERT INTO sensor_status (timestamp, sensor, interface, status, backend, details_json)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (timestamp or time.time(), sensor, interface, status, backend, _dumps(dict(details or {}))),
+            (timestamp or time.time(), clean_text(sensor or ""), clean_text(interface) if interface else interface,
+             status, backend, _dumps(dict(details or {}))),
         )
         return int(cur.lastrowid)
 

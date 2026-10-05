@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 import time
 from collections import Counter, OrderedDict
 from typing import Any, Callable
@@ -268,27 +270,42 @@ class Pipeline:
         if len(self._ap_written) > MAX_AP_WRITE_KEYS:
             self._ap_written.popitem(last=False)
         net = self.registry.network_of(ev)
-        self.db.upsert_ap(bssid=ev.bssid, ssid=ev.ssid, network_id=self.network_ids.get(net.name) if net else None,
-                          authorized=authorized, channel=ev.channel, security=sec,
-                          phy=ev.metadata.get("phy"), rssi=ev.rssi, timestamp=ev.timestamp)
+        try:
+            self.db.upsert_ap(bssid=ev.bssid, ssid=ev.ssid,
+                              network_id=self.network_ids.get(net.name) if net else None,
+                              authorized=authorized, channel=ev.channel, security=sec,
+                              phy=ev.metadata.get("phy"), rssi=ev.rssi, timestamp=ev.timestamp)
+        except (sqlite3.Error, ValueError) as exc:
+            self._storage_error(exc)
+
+    def _storage_error(self, exc: Exception, count: int = 1) -> None:
+        self.stats["storage_errors"] += count
+        self.last_error = repr(exc)
+        logging.getLogger("daybreak.pipeline").warning("database write failed: %s", exc)
 
     def flush(self) -> None:
         if self.db is None:
             return
         if self._events:
-            self.db.insert_events(self._events)
-            self._events = []
+            batch, self._events = self._events, []
+            try:
+                self.db.insert_events(batch)
+            except (sqlite3.Error, ValueError) as exc:  # dropped, counted: never retried forever
+                self._storage_error(exc, len(batch))
         if self._stations:
             per_station: dict[tuple[str, str], Counter] = {}
             for (sta, bssid, kind), n in self._stations.items():
                 per_station.setdefault((sta, bssid), Counter())[kind] += n
             for (sta, bssid), counts in per_station.items():
                 net = self.registry.by_bssid(bssid)
-                self.db.upsert_station(mac=sta, bssid=bssid,
-                                       network_id=self.network_ids.get(net.name) if net else None,
-                                       timestamp=self._station_seen[(sta, bssid)],
-                                       eapol=counts["eapol"], disconnect=counts["disconnect"],
-                                       connect=counts["connect"])
+                try:
+                    self.db.upsert_station(mac=sta, bssid=bssid,
+                                           network_id=self.network_ids.get(net.name) if net else None,
+                                           timestamp=self._station_seen[(sta, bssid)],
+                                           eapol=counts["eapol"], disconnect=counts["disconnect"],
+                                           connect=counts["connect"])
+                except (sqlite3.Error, ValueError) as exc:
+                    self._storage_error(exc)
             self._stations.clear()
             self._station_seen.clear()
         self._last_flush = time.monotonic()

@@ -81,12 +81,33 @@ def is_locally_administered(mac: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# Upper bound for event timestamps (2100-01-01): later values come from broken or crafted
+# input and would break date formatting and time-bucketed statistics.
+MAX_EVENT_TS = 4_102_444_800.0
+
+
+def plausible_timestamp(ts: float) -> bool:
+    return math.isfinite(ts) and 0 < ts <= MAX_EVENT_TS
+
+
+def clean_text(value: str) -> str:
+    """``value`` encodable as UTF-8 (lone surrogates from JSON escapes become '?')."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "replace").decode("utf-8")
+
+
 def parse_timestamp(value: Any) -> float:
     """Parse epoch seconds (int/float/numeric str) or an ISO-8601 string."""
     if isinstance(value, bool):
         raise ValueError("timestamp must not be a boolean")
     if isinstance(value, (int, float)):
-        ts = float(value)
+        try:
+            ts = float(value)
+        except OverflowError as exc:
+            raise ValueError("timestamp out of range") from exc
     elif isinstance(value, str):
         text = value.strip()
         try:
@@ -103,20 +124,26 @@ def parse_timestamp(value: Any) -> float:
             ts = dt.timestamp()
     else:
         raise ValueError(f"invalid timestamp type: {type(value).__name__}")
-    if not math.isfinite(ts) or ts <= 0:
-        raise ValueError(f"timestamp out of range: {value!r}")
+    if not plausible_timestamp(ts):
+        raise ValueError(f"timestamp out of range: {str(value)[:40]!r}")
     return ts
 
 
 def iso_utc(ts: float) -> str:
-    """Epoch seconds -> ``2026-10-05T06:31:11.123Z``."""
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    """Epoch seconds -> ``2026-10-05T06:31:11.123Z`` (``invalid-time`` for unrepresentable values)."""
+    try:
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "invalid-time"
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def format_local(ts: float) -> str:
-    """Epoch seconds -> local ``2026-10-05 15:31:11``."""
-    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    """Epoch seconds -> local ``2026-10-05 15:31:11`` (``invalid-time`` for unrepresentable values)."""
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "invalid-time"
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +494,7 @@ def _sanitize_value(key: str, value: Any) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, str):
-        return value[:_MAX_TEXT]
+        return clean_text(value[:_MAX_TEXT])
     return None  # bytes, mappings, lists and anything else are never persisted
 
 
@@ -611,8 +638,11 @@ class Event:
             sensor = fields.get("sensor") or default_sensor
             if not isinstance(sensor, str):
                 raise ValueError("sensor must be a string")
-        except (ValueError, TypeError) as exc:
-            raise MalformedEventError(str(exc)) from exc
+            sensor = clean_text(sensor)[:64]
+            if ssid is not None:
+                ssid = clean_text(ssid)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise MalformedEventError(str(exc)[:200]) from exc
         event = cls(
             timestamp=ts,
             event_type=etype,
@@ -638,6 +668,8 @@ class Event:
             data = json.loads(line)
         except json.JSONDecodeError as exc:
             raise MalformedEventError(f"invalid JSON: {exc.msg}") from exc
+        except (ValueError, RecursionError) as exc:  # oversized numbers, absurd nesting
+            raise MalformedEventError(f"invalid JSON: {type(exc).__name__}") from exc
         return cls.from_dict(data, default_sensor=default_sensor)
 
 

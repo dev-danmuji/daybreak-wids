@@ -44,6 +44,11 @@ class TokenBucket:
         return False
 
 
+def _band(severity: Severity) -> int:
+    """Rate-limit band: INFO/LOW, MEDIUM, HIGH/CRITICAL."""
+    return 0 if severity <= Severity.LOW else (1 if severity == Severity.MEDIUM else 2)
+
+
 class AlertManager:
     def __init__(self, notifiers: Iterable[Notifier], *, db: Any = None, cooldown: float = 300.0,
                  escalation_delta: int = 10, rate_limit_per_minute: int = 20,
@@ -55,7 +60,10 @@ class AlertManager:
         self.human_log = human_log
         self.dry_run = dry_run
         self.state: dict[tuple[str, str], _KeyState] = {}
-        self.buckets = {id(n): TokenBucket(rate_limit_per_minute) for n in self.notifiers if n.rate_limited}
+        # One budget per notifier and severity band, so that a flood of low-severity alerts
+        # cannot use up the notifications a MEDIUM / HIGH / CRITICAL alert needs.
+        self.buckets = {(id(n), band): TokenBucket(rate_limit_per_minute)
+                        for n in self.notifiers if n.rate_limited for band in (0, 1, 2)}
         self.stats = {"submitted": 0, "delivered": 0, "suppressed": 0, "rate_limited": 0, "notifier_errors": 0}
         self.delivered: list[Alert] = []
 
@@ -91,7 +99,7 @@ class AlertManager:
             if not n.accepts(alert):
                 continue
             note = None
-            bucket = self.buckets.get(id(n))
+            bucket = self.buckets.get((id(n), _band(alert.severity)))
             if bucket is not None:
                 dropped_before = bucket.dropped
                 if not bucket.take(alert.timestamp):

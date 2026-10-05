@@ -28,6 +28,7 @@ from ..models import (
 from ..registry import NetworkRegistry
 
 METRICS = ("disconnects", "eapol", "connects")
+MAX_BASELINE_SPAN = 14 * 86400.0  # seconds of input used for rate statistics
 METRIC_LABEL = {"disconnects": "disconnect frames", "eapol": "EAPOL frames", "connects": "(re)connections"}
 
 
@@ -144,6 +145,9 @@ class BaselineBuilder:
         if self.start is None or self.end is None:
             return out
         first, last = int(self.start // self.cfg.bucket), int(self.end // self.cfg.bucket)
+        # Rates come from at most the last MAX_BASELINE_SPAN of input: a stray event far in the
+        # past must not turn into millions of empty buckets.
+        first = max(first, last - int(MAX_BASELINE_SPAN // self.cfg.bucket) + 1)
         indices = range(first, last + 1)
         for net in self.registry.networks:
             acc = self.nets[net.name]

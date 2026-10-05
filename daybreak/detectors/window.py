@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import bisect
 from collections import deque
 from typing import Any, Callable, Generic, Hashable, Iterable, TypeVar
 
@@ -22,13 +21,10 @@ class SlidingWindow(Generic[T]):
 
     def add(self, ts: float, value: T = None) -> None:  # type: ignore[assignment]
         if self._items and ts < self._items[-1][0]:
-            # slightly out-of-order input: keep the deque sorted
-            items = list(self._items)
-            idx = bisect.bisect_right([t for t, _ in items], ts)
-            items.insert(idx, (ts, value))
-            self._items = deque(items)
-        else:
-            self._items.append((ts, value))
+            # out-of-order input counts as arriving with the newest item (O(1); crafted
+            # replays with decreasing timestamps cannot make every insert O(n))
+            ts = self._items[-1][0]
+        self._items.append((ts, value))
 
     def expire(self, now: float) -> None:
         cutoff = now - self.window

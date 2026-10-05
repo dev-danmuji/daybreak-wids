@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterator
 
 from ..dot11.frames import FrameParseError, parse_frame
-from ..models import Event
+from ..models import Event, plausible_timestamp
 from .backend import Backend, BackendStatus, BackendUnavailable
 
 PCAP_MAGIC = {
@@ -19,6 +19,9 @@ PCAP_MAGIC = {
     b"\x4d\x3c\xb2\xa1": ("<", 1e-9), b"\xa1\xb2\x3c\x4d": (">", 1e-9),
 }
 PCAPNG_SHB = 0x0A0D0D0A
+# A captured 802.11 frame is far smaller; these bound the memory one record or block can take.
+MAX_RECORD = 256 * 1024
+MAX_BLOCK = 16 * 1024 * 1024
 
 
 class CaptureFormatError(ValueError):
@@ -47,6 +50,8 @@ def _iter_pcap(fh: BinaryIO, magic: bytes) -> Iterator[tuple[float, int, bytes]]
         if len(rec) < 16:
             return
         sec, frac, incl, _orig = struct.unpack(endian + "IIII", rec)
+        if incl > MAX_RECORD:
+            raise CaptureFormatError(f"pcap record of {incl} bytes exceeds {MAX_RECORD}")
         data = fh.read(incl)
         if len(data) < incl:
             return
@@ -62,43 +67,62 @@ def _iter_pcapng(fh: BinaryIO, first: bytes) -> Iterator[tuple[float, int, bytes
         pending = b""
         if len(hdr) < 8:
             return
-        btype_raw = hdr[:4]
-        if struct.unpack("<I", btype_raw)[0] == PCAPNG_SHB:
+        if struct.unpack("<I", hdr[:4])[0] == PCAPNG_SHB:
             bom = fh.read(4)
+            if len(bom) < 4:
+                return
+            if bom not in (b"\x4d\x3c\x2b\x1a", b"\x1a\x2b\x3c\x4d"):
+                raise CaptureFormatError("invalid pcapng byte-order magic")
             endian = "<" if bom == b"\x4d\x3c\x2b\x1a" else ">"
             (blen,) = struct.unpack(endian + "I", hdr[4:8])
-            fh.read(blen - 12)
+            _check_block_length(blen)
+            if len(fh.read(blen - 12)) < blen - 12:
+                return
             interfaces = []
             continue
         btype, blen = struct.unpack(endian + "II", hdr)
-        if blen < 12:
-            raise CaptureFormatError("invalid pcapng block length")
+        _check_block_length(blen)
         body = fh.read(blen - 8)
         if len(body) < blen - 8:
             return
-        body = body[:-4]
-        if btype == 1:  # Interface Description Block
-            linktype = struct.unpack_from(endian + "H", body, 0)[0]
-            unit = 1e-6
-            off = 8
-            while off + 4 <= len(body):
-                code, olen = struct.unpack_from(endian + "HH", body, off)
-                if code == 0:
-                    break
-                if code == 9 and olen >= 1:  # if_tsresol
-                    v = body[off + 4]
-                    unit = 2.0 ** -(v & 0x7F) if v & 0x80 else 10.0 ** -v
-                off += 4 + ((olen + 3) & ~3)
-            interfaces.append((linktype, unit))
-        elif btype == 6:  # Enhanced Packet Block
-            iface, ts_hi, ts_lo, cap = struct.unpack_from(endian + "IIII", body, 0)
-            if iface >= len(interfaces):
-                continue
-            linktype, unit = interfaces[iface]
-            yield ((ts_hi << 32) | ts_lo) * unit, linktype, body[20:20 + cap]
-        elif btype == 3 and interfaces:  # Simple Packet Block
-            linktype, _unit = interfaces[0]
-            yield 0.0, linktype, body[4:]
+        body = body[:-4]  # trailing copy of the block length
+        try:
+            if btype == 1:  # Interface Description Block
+                interfaces.append(_interface(body, endian))
+            elif btype == 6:  # Enhanced Packet Block
+                iface, ts_hi, ts_lo, cap = struct.unpack_from(endian + "IIII", body, 0)
+                if cap > len(body) - 20:
+                    raise CaptureFormatError("pcapng packet longer than its block")
+                if iface >= len(interfaces):
+                    continue
+                linktype, unit = interfaces[iface]
+                yield ((ts_hi << 32) | ts_lo) * unit, linktype, body[20:20 + cap]
+            elif btype == 3 and interfaces:  # Simple Packet Block (no timestamp)
+                linktype, _unit = interfaces[0]
+                yield 0.0, linktype, body[4:]
+        except struct.error as exc:
+            raise CaptureFormatError(f"malformed pcapng block (type {btype})") from exc
+
+
+def _check_block_length(blen: int) -> None:
+    if blen < 12 or blen % 4 or blen > MAX_BLOCK:
+        raise CaptureFormatError(f"invalid pcapng block length {blen}")
+
+
+def _interface(body: bytes, endian: str) -> tuple[int, float]:
+    """(link type, timestamp unit) of an Interface Description Block."""
+    linktype = struct.unpack_from(endian + "H", body, 0)[0]
+    unit = 1e-6
+    off = 8
+    while off + 4 <= len(body):
+        code, olen = struct.unpack_from(endian + "HH", body, off)
+        if code == 0 or off + 4 + olen > len(body):
+            break
+        if code == 9 and olen >= 1:  # if_tsresol
+            v = body[off + 4]
+            unit = 2.0 ** -(v & 0x7F) if v & 0x80 else 10.0 ** -min(v, 64)
+        off += 4 + ((olen + 3) & ~3)
+    return linktype, unit
 
 
 class PcapFileBackend(Backend):
@@ -111,7 +135,7 @@ class PcapFileBackend(Backend):
         self._fh: BinaryIO | None = None
         self._iter: Iterator[tuple[float, int, bytes]] | None = None
         self._done = False
-        self.stats.update(frames=0, unparsable=0, ignored=0)
+        self.stats.update(frames=0, unparsable=0, ignored=0, bad_timestamp=0)
 
     def open(self) -> None:
         try:
@@ -136,8 +160,12 @@ class PcapFileBackend(Backend):
         try:
             for ts, linktype, data in self._iter:
                 self.stats["frames"] += 1
+                ts = ts or 1.0
+                if not plausible_timestamp(ts):
+                    self.stats["bad_timestamp"] += 1
+                    continue
                 try:
-                    ev = parse_frame(data, linktype=linktype, timestamp=ts or 1.0, sensor=self.sensor_name)
+                    ev = parse_frame(data, linktype=linktype, timestamp=ts, sensor=self.sensor_name)
                 except FrameParseError:
                     self.stats["unparsable"] += 1
                     continue
@@ -156,5 +184,7 @@ class PcapFileBackend(Backend):
         return out
 
     def status(self) -> BackendStatus:
+        if not self.stats["frames"]:
+            return BackendStatus(self.name, True, f"reading {self.path}")
         return BackendStatus(self.name, True, f"reading {self.path} ({self.stats['frames']} frames, "
                              f"{self.stats['events']} events)")

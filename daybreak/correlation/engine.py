@@ -36,6 +36,8 @@ SUMMARIES = {
 }
 
 CORE_DEAUTH = ("deauth_burst", "broadcast_deauth")
+MAX_TRACKED = 1024      # stations / rogue BSSIDs remembered per incident and per BSSID
+MAX_INCIDENTS = 4096
 SPOOF_STRONG = {"security_downgrade", "incompatible_duplicate", "pmf_downgrade", "encryption_change"}
 
 
@@ -71,9 +73,13 @@ class Incident:
         self.channel = f.channel or self.channel
         if self.kind == "bssid":
             for s in f.stations:
-                self.disconnected.setdefault(s, f.timestamp)
-        elif f.bssid and f.details.get("authorized") is False:
+                self.note_disconnect(s, f.timestamp)
+        elif f.bssid and f.details.get("authorized") is False and len(self.rogue_bssids) < MAX_TRACKED:
             self.rogue_bssids.add(f.bssid)
+
+    def note_disconnect(self, station: str, ts: float) -> None:
+        if station in self.disconnected or len(self.disconnected) < MAX_TRACKED:
+            self.disconnected.setdefault(station, ts)
 
 
 def _component(f: Finding, sources: set[str]) -> ScoreComponent:
@@ -184,7 +190,7 @@ class CorrelationEngine:
             inc = self.incidents.get(f"bssid:{ev.bssid}")
             if inc is not None:
                 for sta in targets:
-                    inc.disconnected.setdefault(sta, ts)
+                    inc.note_disconnect(sta, ts)
             self._prune(ev.bssid, ts)
             return []
         # Association alone is not evidence of a handshake; EAPOL from the station is required.
@@ -204,9 +210,15 @@ class CorrelationEngine:
         book = self.recent_disconnects.get(bssid, {})
         for sta in [s for s, t in book.items() if now - t > horizon]:
             del book[sta]
+        while len(book) > MAX_TRACKED:
+            del book[next(iter(book))]
+        if not book:
+            self.recent_disconnects.pop(bssid, None)
         reauth = self.recent_reauth.get(bssid, {})
         for sta in [s for s, (t, _) in reauth.items() if now - t > horizon]:
             del reauth[sta]
+        if not reauth:
+            self.recent_reauth.pop(bssid, None)
 
     # -- assessment ------------------------------------------------------------------------------
     def _intensity(self, inc: Incident) -> ScoreComponent | None:
@@ -308,5 +320,8 @@ class CorrelationEngine:
     def expire(self, now: float) -> None:
         for key in [k for k, i in self.incidents.items() if now - i.last_update > self.cfg.window * 2]:
             del self.incidents[key]
-        for bssid in list(self.recent_disconnects):
+        if len(self.incidents) > MAX_INCIDENTS:  # a flood of random BSSIDs: keep the most active
+            keep = sorted(self.incidents.items(), key=lambda kv: kv[1].last_update)[-MAX_INCIDENTS:]
+            self.incidents = dict(keep)
+        for bssid in set(self.recent_disconnects) | set(self.recent_reauth):
             self._prune(bssid, now)

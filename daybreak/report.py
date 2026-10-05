@@ -6,6 +6,7 @@ import time
 from collections import Counter
 from typing import Any
 
+from .alerts.formatting import printable
 from .config import Config
 from .detectors.security import audit_network, observations_from_rows
 from .models import Severity, format_local
@@ -101,4 +102,4 @@ def render_report(rep: dict[str, Any]) -> str:
     if rep["recommendations"]:
         lines += ["", "Recommendations"]
         lines += [f"  - {r}" for r in rep["recommendations"]]
-    return "\n".join(lines)
+    return "\n".join(printable(line) for line in lines)

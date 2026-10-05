@@ -57,7 +57,7 @@ class ReplayBackend(Backend):
                 continue
             try:
                 ev = Event.from_json(text, default_sensor=self.sensor_name)
-            except MalformedEventError as exc:
+            except (MalformedEventError, ValueError, TypeError, OverflowError, RecursionError) as exc:
                 self.stats["malformed"] += 1
                 self.note_error(f"line {self._line_no}: {exc}")
                 continue
@@ -91,5 +91,7 @@ class ReplayBackend(Backend):
 
     def status(self) -> BackendStatus:
         src = self.source if isinstance(self.source, (str, Path)) else "stream"
+        if not (self.stats["events"] or self.stats["malformed"]):
+            return BackendStatus(self.name, True, f"replaying {src}")
         return BackendStatus(self.name, True, f"replaying {src} ({self.stats['events']} events, "
                              f"{self.stats['malformed']} malformed)")

@@ -607,3 +607,215 @@ def test_desktop_notifications_are_disabled_as_root(monkeypatch):
     monkeypatch.setattr(desktop.os, "geteuid", lambda: 0)
     available, why = desktop.desktop_available()
     assert not available and "root" in why
+
+
+# -- untrusted input: capture files, JSONL, timestamps, text ---------------------------------------------------
+
+def _pcapng_block(btype, body, total=None):
+    import struct
+
+    body = body + b"\x00" * (-len(body) % 4)
+    length = 12 + len(body) if total is None else total
+    return struct.pack("<II", btype, length) + body + struct.pack("<I", length)
+
+
+def _pcapng(*blocks):
+    import struct
+
+    shb = _pcapng_block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    return shb + b"".join(blocks)
+
+
+def _idb(extra=b""):
+    import struct
+
+    return _pcapng_block(1, struct.pack("<HHI", 127, 0, 0) + extra)
+
+
+def _epb(frame, ts_us):
+    import struct
+
+    return _pcapng_block(6, struct.pack("<IIIII", 0, ts_us >> 32, ts_us & 0xFFFFFFFF, len(frame), len(frame)) + frame)
+
+
+def _read_capture(path):
+    from daybreak.sensor.pcapfile import PcapFileBackend
+
+    backend = PcapFileBackend(path)
+    backend.open()
+    events = []
+    try:
+        while not backend.finished:
+            events += backend.poll(0)
+    finally:
+        backend.close()
+    return backend, events
+
+
+def test_malformed_capture_files_fail_cleanly(tmp_path):
+    import struct
+
+    import frames_hex as F
+    from daybreak.sensor.backend import BackendUnavailable
+
+    frame = F.RT_5180 + F.DEAUTH_UNICAST
+    shb = _pcapng()
+    cases = {
+        "idb_too_short": shb + struct.pack("<III", 1, 12, 12),
+        "epb_too_short": _pcapng(_idb(), _epb(frame, 1_790_000_000_000_000)) + struct.pack("<III", 6, 12, 12),
+        "shb_length_zero": shb + struct.pack("<II", 0x0A0D0D0A, 0) + b"\x4d\x3c\x2b\x1a",
+        "block_too_long": shb + struct.pack("<II", 6, 0x7FFFFFF0),
+        "pcap_huge_record": (b"\xd4\xc3\xb2\xa1" + struct.pack("<HHiIII", 2, 4, 0, 0, 65535, 127)
+                             + struct.pack("<IIII", 1_790_000_000, 0, 0x7FFFFFFF, 0x7FFFFFFF)),
+    }
+    for name, data in cases.items():
+        (tmp_path / name).write_bytes(data)
+        with pytest.raises(BackendUnavailable):
+            _read_capture(tmp_path / name)
+    # an if_tsresol option without its value byte is ignored, not a crash
+    (tmp_path / "tsresol").write_bytes(_pcapng(_idb(struct.pack("<HH", 9, 1))))
+    _read_capture(tmp_path / "tsresol")
+
+
+def test_implausible_capture_timestamps_are_skipped(tmp_path):
+    import frames_hex as F
+
+    frame = F.RT_5180 + F.DEAUTH_UNICAST
+    (tmp_path / "ts.pcapng").write_bytes(_pcapng(_idb(), _epb(frame, 2**64 - 1), _epb(frame, 1_790_000_000_000_000)))
+    backend, events = _read_capture(tmp_path / "ts.pcapng")
+    assert len(events) == 1 and backend.stats["bad_timestamp"] == 1
+
+
+def test_bad_jsonl_lines_are_counted_not_fatal():
+    from daybreak.sensor.replay import ReplayBackend
+
+    good = '{"timestamp": 1790000001, "event_type": "deauth"}'
+    bad = ['{"timestamp": 1790000000, "event_type": "deauth", "rssi": Infinity}',
+           '{"timestamp": 1' + "0" * 400 + ', "event_type": "deauth"}',
+           '{"timestamp": 1' + "0" * 5000 + ', "event_type": "deauth"}',
+           '{"timestamp": 1e12, "event_type": "deauth"}']
+    backend = ReplayBackend(bad + [good])
+    backend.open()
+    events = backend.poll(0)
+    assert len(events) == 1 and backend.stats["malformed"] == len(bad)
+    # absurd nesting: either parsed (extra fields are ignored) or counted as malformed, never fatal
+    nested = '{"timestamp": 1790000000, "event_type": "deauth", "x": ' + "[" * 100_000 + "]" * 100_000 + "}"
+    backend = ReplayBackend([nested, good])
+    backend.open()
+    assert len(backend.poll(0)) + backend.stats["malformed"] == 2
+
+
+def test_unrepresentable_times_never_break_output():
+    from daybreak.models import format_local, iso_utc
+
+    for ts in (1e13, -1e13, float("inf"), float("nan")):
+        assert format_local(ts) == "invalid-time" and iso_utc(ts) == "invalid-time"
+
+
+def test_lone_surrogates_are_stored_cleaned(tmp_path):
+    from daybreak.models import Event
+
+    db = Database(tmp_path / "s.db")
+    ev = Event.from_json('{"timestamp": 1790000000, "event_type": "deauth", "bssid": "aa:bb:cc:dd:ee:ff", '
+                         '"sensor": "\\ud800x", "metadata": {"note": "\\udfff"}}')
+    db.insert_event(ev)
+    row = db.query_events()[0]
+    assert row["sensor"] == "?x" and row["metadata"]["note"] == "?"
+    db.close()
+
+
+def test_failed_database_writes_are_dropped_and_counted(tmp_path, monkeypatch):
+    import sqlite3
+
+    from daybreak.models import Event
+    from daybreak.runtime import build_runtime
+
+    rt = build_runtime(make_config(tmp_path))
+
+    def refuse(events):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(rt.db, "insert_events", refuse)
+    rt.pipeline.process(Event.from_dict({"ts": 1_790_000_000, "type": "deauth", "bssid": "AA:BB:CC:DD:EE:FF",
+                                         "src": "AA:BB:CC:DD:EE:FF", "dst": "10:22:33:44:55:66", "reason": 7}))
+    rt.pipeline.flush()
+    rt.pipeline.flush()  # nothing left to retry
+    assert rt.pipeline.stats["storage_errors"] == 1
+    rt.close()
+
+
+def test_kismet_open_failure_is_a_backend_outage():
+    from daybreak.config import KismetConfig
+    from daybreak.sensor.backend import BackendUnavailable
+    from daybreak.sensor.kismet import KismetBackend, KismetUnavailable
+
+    class Client:
+        base, api_key = "http://127.0.0.1:2501", None
+
+        def auth_headers(self):
+            return {}
+
+        def system_status(self):
+            return {"kismet.system.version": "test"}
+
+        def server_time(self, status=None):
+            return 1_790_000_000.0
+
+        def datasources(self):
+            raise KismetUnavailable("timed out")
+
+    backend = KismetBackend(KismetConfig(use_eventbus=False, frame_tap=False), sensor_interface=ALFA, client=Client())
+    with pytest.raises(BackendUnavailable, match="timed out"):
+        backend.open()
+
+
+def test_text_report_escapes_control_characters():
+    from daybreak.report import render_report
+
+    rep = {"period": {"since": 1_790_000_000, "until": 1_790_000_600}, "threat_level": "NORMAL",
+           "sensor": {"interface": "wlan\x1b[2J0", "status": []},
+           "alerts": {"total": 0, "by_severity": {}, "by_type": {}, "acknowledged": 0, "important": []},
+           "events": {}, "networks": [], "baselines": [], "recommendations": []}
+    text = render_report(rep)
+    assert "\x1b" not in text and "\\x1b[2J" in text
+
+
+def test_baseline_rates_use_a_bounded_window(tmp_path):
+    import time
+
+    from daybreak.baseline.engine import BaselineBuilder
+    from daybreak.models import Event, EventType
+
+    b = BaselineBuilder(make_config(tmp_path))
+    for ts in (1.0, 1_790_000_000.0):  # a stray event decades before the real one
+        b.add(Event(ts, EventType.DEAUTH, bssid="AA:BB:CC:DD:EE:FF", source="AA:BB:CC:DD:EE:FF",
+                    destination="10:22:33:44:55:66"))
+    started = time.monotonic()
+    b.metrics()
+    assert time.monotonic() - started < 5.0
+
+
+def test_incident_bookkeeping_is_bounded(tmp_path):
+    from daybreak.correlation.engine import MAX_TRACKED, Incident
+
+    inc = Incident(key="bssid:x", kind="bssid", opened=1.0, last_update=1.0)
+    for i in range(MAX_TRACKED * 2):
+        inc.note_disconnect(f"10:00:00:00:{i >> 8 & 255:02X}:{i & 255:02X}", 1.0 + i)
+    assert len(inc.disconnected) == MAX_TRACKED
+
+
+def test_low_severity_flood_cannot_starve_a_high_alert_on_the_console():
+    import io
+
+    from daybreak.alerts.console import ConsoleNotifier
+    from daybreak.alerts.manager import AlertManager
+    from daybreak.models import Alert, ScoreComponent
+
+    out = io.StringIO()
+    manager = AlertManager([ConsoleNotifier("LOW", stream=out, color=False)], rate_limit_per_minute=5)
+    for i in range(50):  # decoys: distinct LOW alerts
+        manager.submit(Alert("DEAUTH_BURST", 1_790_000_000.0 + i * 0.1, 30, [ScoreComponent(30, "burst", "")],
+                             bssid=f"02:00:00:00:00:{i:02X}", summary="decoy"))
+    manager.submit(Alert("POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT", 1_790_000_006.0, 95,
+                         [ScoreComponent(95, "pattern", "")], bssid="AA:BB:CC:DD:EE:FF", summary="real"))
+    assert "CRITICAL POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT" in out.getvalue()

@@ -146,21 +146,24 @@ class StationTracker:
 
     def __init__(self, ttl: float = 900.0):
         self.ttl = ttl
-        self.seen: dict[str, dict[str, float]] = {}
+        # LRU order on both levels: eviction is O(1) even while a flood keeps adding entries
+        self.seen: OrderedDict[str, OrderedDict[str, float]] = OrderedDict()
 
     def observe(self, ev: Event) -> None:
         if not ev.bssid or not ev.station or is_group_address(ev.station):
             return
         if ev.event_type in CONNECT_TYPES or ev.event_type is EventType.EAPOL:
-            stations = self.seen.setdefault(ev.bssid, {})
+            stations = self.seen.get(ev.bssid)
+            if stations is None:
+                stations = self.seen[ev.bssid] = OrderedDict()
+                if len(self.seen) > self.MAX_BSSIDS:
+                    self.seen.popitem(last=False)
+            else:
+                self.seen.move_to_end(ev.bssid)
             stations[ev.station] = ev.timestamp
+            stations.move_to_end(ev.station)
             if len(stations) > self.MAX_PER_BSSID:
-                for s in [s for s, t in stations.items() if ev.timestamp - t > self.ttl]:
-                    del stations[s]
-                while len(stations) > self.MAX_PER_BSSID:
-                    del stations[min(stations, key=stations.__getitem__)]
-            if len(self.seen) > self.MAX_BSSIDS:
-                del self.seen[min(self.seen, key=lambda b: max(self.seen[b].values(), default=0.0))]
+                stations.popitem(last=False)
 
     def associated(self, bssid: str, now: float) -> set[str]:
         stations = self.seen.get(bssid, {})

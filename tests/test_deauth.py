@@ -43,8 +43,9 @@ def test_sliding_window_expiry_and_order():
         w.add(t, t)
     assert w.count(4.9) == 4
     assert w.count(5.0) == 3          # t=0 is exactly window-old -> expired
-    w.add(2.5, "late")                # out-of-order insert stays sorted
-    assert w.values(6.0) == [2, "late", 3]
+    w.add(2.5, "late")                # out-of-order input counts as arriving with the newest item (O(1))
+    assert w.values(6.0) == [2, 3, "late"]
+    assert w.values(7.9) == [3, "late"]   # ...and expires together with it
     assert w.distinct(100.0) == set()
 
 

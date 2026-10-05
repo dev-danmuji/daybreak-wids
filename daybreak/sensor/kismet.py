@@ -556,7 +556,10 @@ class KismetBackend(Backend):
         self.last_alert_ts = server
         self.last_device_ts = server - 60.0  # initial AP security snapshot
         self._healthy = True
-        self._refresh_datasources()
+        try:
+            self._refresh_datasources()
+        except KismetError as exc:
+            raise BackendUnavailable(str(exc)) from exc
         if self.cfg.use_eventbus and (self.eventbus_connect or EventbusReader.available()):
             self.eventbus = EventbusReader(eventbus_url(self.client.base), self._queue,
                                            connect=self.eventbus_connect, headers=self.client.auth_headers())
