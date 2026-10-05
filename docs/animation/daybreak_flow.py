@@ -13,9 +13,9 @@ replay adds more signals and reaches 95, CRITICAL; the final card says both.
 Nothing is captured, sent or replayed: this file only draws, and nothing in it
 moves away from the sensor.
 
-Render with Manim Community Edition (0.19 or newer; written against 0.21) and
-convert to a GIF with ffmpeg: see docs/animation/README.md or run
-``docs/animation/render.sh``.
+Rendered with Manim Community Edition 0.21.0 and converted to a GIF with ffmpeg
+(docs/assets/daybreak-flow.mp4 / .gif); to re-render, run
+``docs/animation/render.sh`` (see docs/animation/README.md).
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ from manim import (
     NORMAL,
     RIGHT,
     UP,
-    AnimationGroup,
     Circle,
     Dot,
     FadeIn,
@@ -37,6 +36,7 @@ from manim import (
     Rectangle,
     RoundedRectangle,
     Scene,
+    Succession,
     Text,
     ValueTracker,
     VGroup,
@@ -232,7 +232,7 @@ class DaybreakFlow(Scene):
             nonlocal current
             new = caption(n)
             old, current = current, new
-            return AnimationGroup(FadeOut(old), FadeIn(new))
+            return Succession(FadeOut(old), FadeIn(new))  # one after the other: no overlapping text
 
         # -- observed frames: dots from the links into the sensor (inbound only) -------------------
         def observed(color: str):
@@ -298,7 +298,7 @@ class DaybreakFlow(Scene):
         # 8. what Daybreak never does
         footer = VGroup(text("Passive defensive monitoring only", CAP_FOOTER, bold=True),
                         text("No packet injection / No credential cracking", CAP_FOOTER, color=MUTED))
-        footer.arrange(DOWN, buff=0.16).move_to([0, -3.52, 0])
+        footer.arrange(DOWN, buff=0.16).move_to([0, -3.42, 0])
         self.play(FadeIn(footer, shift=UP * 0.1), run_time=0.7)
         self.wait(1.9)
 
@@ -306,6 +306,8 @@ class DaybreakFlow(Scene):
         self.play(step(1), FadeOut(alert), FadeOut(footer), FadeOut(line), shown.animate.set_value(0),
                   score.animate.set_value(0), feed.animate.set_stroke(color=LINE, width=2),
                   engine[0].animate.set_stroke(color=LINE, width=2), run_time=0.6, rate_func=linear)
+        # Manim renders a play() up to, not including, its end state: show that state briefly
+        self.wait(0.2)
 
     @staticmethod
     def flash(frame, color: str):
@@ -314,11 +316,11 @@ class DaybreakFlow(Scene):
 
     def alert_card(self):
         severity = VGroup(text("HIGH", CAP_ALERT, color=HIGH, bold=True), text("/", CAP_ALERT, color=MUTED),
-                          text("CRITICAL", CAP_ALERT, color=CRITICAL, bold=True).set_opacity(0.55))
+                          text("CRITICAL", CAP_ALERT, color=CRITICAL, bold=True).set_opacity(0.7))
         severity.arrange(RIGHT, buff=0.22)
         kind = text("POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT", CAP_ALERT_TYPE, mono=True)
         note = text("this example: 72 HIGH  ·  README demo replay: 95 CRITICAL", CAP_SMALL, color=MUTED)
-        lines = VGroup(severity, kind, note).arrange(DOWN, buff=0.2)
+        lines = VGroup(severity, kind, note).arrange(DOWN, buff=0.16)
         fit(lines, 10.4)
-        frame = box(11.0, lines.height + 0.44, stroke=HIGH)
-        return VGroup(frame, lines.move_to(frame.get_center())).move_to([0, -2.2, 0])
+        frame = box(11.0, lines.height + 0.34, stroke=HIGH)
+        return VGroup(frame, lines.move_to(frame.get_center())).move_to([0, -2.18, 0])

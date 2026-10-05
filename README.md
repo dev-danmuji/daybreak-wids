@@ -9,12 +9,10 @@
 > Only use this project on wireless networks you own or have explicit
 > authorization to monitor.
 
-<!-- Animation, not rendered yet: run docs/animation/render.sh, then delete this line and the closing marker line below.
 <p align="center">
-  <img src="docs/assets/daybreak-flow.gif" alt="Animation with synthetic data: a deauthentication burst disconnects the clients of a protected access point, they reconnect and re-authenticate, and Daybreak's correlation engine adds the signals up to a HIGH POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT alert. Passive defensive monitoring only.">
+  <img src="docs/assets/daybreak-flow.gif" alt="Animation with synthetic data: four clients connected to a protected access point; a deauthentication burst disconnects them, they reconnect and re-authenticate, and a receive-only sensor reports both observations to Daybreak's correlation engine. The risk score adds up 30 (deauth burst), 45 (several clients affected), 55 (same clients re-authenticate) and 72 (EAPOL reauthentication surge), giving a HIGH POSSIBLE_HANDSHAKE_CAPTURE_ATTEMPT alert. Closing text: passive defensive monitoring only, no packet injection, no credential cracking.">
 </p>
 <p align="center"><sub><a href="docs/assets/daybreak-flow.mp4">MP4 version</a> · source: <a href="docs/animation/">docs/animation/</a></sub></p>
--->
 
 **How a detection is built** (synthetic example): a deauthentication burst
 disconnects several clients of a protected access point, the same clients
@@ -44,13 +42,13 @@ every alert lists the signals that produced its risk score.
 | Host | Ubuntu 26.04.1 LTS, Linux 7.0, LattePanda 3 Delta |
 | Sensor | ALFA USB adapter, MediaTek MT7921U (USB `0e8d:7961`), driver `mt7921u`, 2.4 / 5 / 6 GHz, monitor mode supported (live capture: see validation status) |
 | Python | 3.10, 3.11, 3.12, 3.13, 3.14 |
-| Tests | 478 automated tests: synthetic frames and metadata, a simulated Kismet API; no hardware, root or radio needed |
+| Tests | 491 automated tests: synthetic frames and metadata, a simulated Kismet API; no hardware, root or radio needed |
 
 **Validation status** (details: [docs/VALIDATION.md](docs/VALIDATION.md))
 
 | Area | Status |
 |---|---|
-| Automated test suite on Python 3.10–3.14 | PASS (478 tests) |
+| Automated test suite on Python 3.10–3.14 | PASS (491 tests) |
 | Sensor discovery and readiness checks on the ALFA MT7921U | PASS (read-only, on the tested host) |
 | Internet interface (`wlo1`) untouched by sensor checks | PASS (before/after snapshots) |
 | Live passive capture on the ALFA in monitor mode | NOT VERIFIED YET (needs root; guided procedure: [`scripts/hardware-smoke-test.sh`](scripts/hardware-smoke-test.sh)) |
@@ -706,7 +704,7 @@ unregistered APs is stored. `var/`, `config.yaml`, `networks.yaml`, databases, l
 ## Testing
 
 ```bash
-pytest                                    # 478 tests, about 20 s on the test host
+pytest                                    # 491 tests, about 25 s on the test host
 python tests/fixtures/make_fixtures.py    # regenerate the synthetic fixtures
 ```
 

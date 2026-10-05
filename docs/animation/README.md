@@ -1,10 +1,10 @@
 # README animation
 
 `daybreak_flow.py` is the [Manim](https://www.manim.community/) source of the
-short animation meant for the top of the project README:
+animation at the top of the project README:
 
-- `docs/assets/daybreak-flow.mp4`: 1280 × 720, 30 fps, about 14 s
-- `docs/assets/daybreak-flow.gif`: about 900 px wide, 12–15 fps, looping, at most 8 MB
+- `docs/assets/daybreak-flow.mp4`: 1280 × 720, 30 fps, 14.6 s, 0.9 MB (H.264)
+- `docs/assets/daybreak-flow.gif`: 900 × 506, 15 fps, 14.6 s, looping, 2.8 MB
 
 It shows how a detection is built: a protected access point and its four
 clients, a deauthentication burst that disconnects them, the clients
@@ -25,12 +25,23 @@ draws: no attacker or attack tool is shown, nothing moves away from the sensor,
 and no frames are captured, crafted or replayed. Colours are the dashboard's
 dark theme.
 
-## Status
+## How the committed files were made
 
-The MP4 and GIF have **not been rendered yet**: Manim and ffmpeg were not
-installed on the machine where the scene was written, and nothing was installed
-for it. The README therefore keeps the GIF reference commented out; see
-[Enable it in the README](#enable-it-in-the-readme).
+With Manim Community 0.21.0 and ffmpeg 9.0.2 in a local, disposable environment
+outside the repository (nothing installed system-wide): pycairo and ManimPango
+have no Linux wheels and need the Cairo / Pango development headers, so the
+native libraries came from conda-forge through a standalone `micromamba`, and
+Manim from PyPI on top:
+
+```bash
+env=~/.cache/daybreak-wids-render/env
+micromamba create -p "$env" -c conda-forge python=3.12 "pycairo>=1.14,<2" "manimpango>=0.6.1,<1" ffmpeg pip
+"$env/bin/python" -m pip install "manim==0.21.0"
+PATH="$env/bin:$PATH" MANIM="$env/bin/manim" docs/animation/render.sh
+```
+
+Delete `~/.cache/daybreak-wids-render` afterwards to remove all of it. The
+system-package route below works as well.
 
 ## Requirements
 
@@ -107,9 +118,9 @@ ffmpeg -hide_banner -y -i docs/assets/daybreak-flow.mp4 -filter_complex \
 
 If the GIF is larger than 8 MB, `render.sh` retries with 12 fps, then 128
 colours, then 800 px and 720 px wide (still 12 fps), and keeps the first result
-that fits. A rough estimate from a simulation of this pipeline (not a
-measurement) is 1.5–2.5 MB at 900 px and 15 fps. The README shows the GIF at its
-own width, so a smaller fallback is not upscaled.
+that fits. The committed GIF needed no fallback (2.8 MB at 900 px and 15 fps).
+The README shows the GIF at its own width, so a smaller fallback would not be
+upscaled.
 
 For a quick low-resolution preview while editing the scene:
 `manim render -ql -p docs/animation/daybreak_flow.py DaybreakFlow`.
@@ -121,12 +132,12 @@ For a quick low-resolution preview while editing the scene:
 - Every text is readable at the size GitHub shows the GIF, and nothing overlaps.
 - Only the synthetic values above appear: no real SSID, BSSID or MAC address.
 
-## Enable it in the README
+## In the README
 
-`README.md` has the GIF and MP4 references in an HTML comment right below the
-safety notice, followed by a short text description that stays in place (it
-explains the flow when the GIF does not load). After rendering, delete the line
-that opens the comment ("Animation, not rendered yet ...") and its closing
-marker line. `tests/test_readme.py` checks that every image the README shows
-exists, and fails once `docs/assets/daybreak-flow.gif` exists but is still
-commented out.
+`README.md` shows the GIF right below the safety notice, with an alt text that
+describes every step and a link to the MP4 (GitHub plays MP4 files only when
+they are uploaded as attachments, so the repository copy is a link). The short
+"How a detection is built" paragraph below it explains the same flow in words,
+for viewers whose GIFs do not load or do not autoplay. `tests/test_readme.py`
+checks that every image the README shows exists and that the animation is shown
+whenever `docs/assets/daybreak-flow.gif` exists.
